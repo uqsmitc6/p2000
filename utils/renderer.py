@@ -11,10 +11,13 @@ Requires LibreOffice to be installed (available via system package or Docker).
 import io
 import os
 import glob
+import logging
 import shutil
 import tempfile
 import subprocess
 from pathlib import Path
+
+logger = logging.getLogger("uqslide.renderer")
 
 
 def render_slides_to_images(
@@ -66,21 +69,22 @@ def render_slides_to_images(
         )
 
         if result.returncode != 0:
-            # LibreOffice sometimes outputs one PNG for the whole deck
+            logger.warning("LibreOffice PNG export returned code %d: %s",
+                           result.returncode, result.stderr[:500] if result.stderr else "")
             # Check if we at least got something
-            pass
 
         # Collect output images
         # LibreOffice may output a single PNG or multiple depending on version
         png_files = sorted(glob.glob(os.path.join(tmpdir, "*.png")))
 
         if not png_files:
-            return []
+            logger.warning("LibreOffice produced no PNG files — trying PDF route")
+            return _render_via_pdf(input_path, tmpdir, dpi, timeout, env)
 
         # If LibreOffice output a single image, that's the whole deck rendered
         # as one page — we need individual slides. Try PDF intermediate approach.
         if len(png_files) == 1:
-            # Try via PDF → per-page PNGs
+            logger.info("LibreOffice produced 1 PNG — trying PDF route for per-slide images")
             return _render_via_pdf(input_path, tmpdir, dpi, timeout, env)
 
         # Read all PNGs in order
@@ -92,11 +96,13 @@ def render_slides_to_images(
         return images
 
     except subprocess.TimeoutExpired:
+        logger.error("LibreOffice timed out after %d seconds", timeout)
         return []
     except FileNotFoundError:
-        # LibreOffice not installed
+        logger.error("LibreOffice not found — is it installed?")
         return []
-    except Exception:
+    except Exception as e:
+        logger.error("Unexpected rendering error: %s", e, exc_info=True)
         return []
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -138,9 +144,12 @@ def _render_via_pdf(
 
     pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
     if not pdf_files:
+        logger.error("LibreOffice PDF conversion produced no output. stderr: %s",
+                      result.stderr[:500] if result.stderr else "")
         return []
 
     pdf_path = pdf_files[0]
+    logger.info("PDF created: %s (%d bytes)", pdf_path, os.path.getsize(pdf_path))
 
     # Step 2: PDF → PNGs using pdftoppm (poppler-utils)
     png_dir = os.path.join(tmpdir, "png_out")
@@ -165,13 +174,14 @@ def _render_via_pdf(
 
         png_files = sorted(glob.glob(os.path.join(png_dir, "slide-*.png")))
         if png_files:
+            logger.info("pdftoppm produced %d slide images", len(png_files))
             images = []
             for png_path in png_files:
                 with open(png_path, "rb") as f:
                     images.append(f.read())
             return images
     except FileNotFoundError:
-        pass
+        logger.warning("pdftoppm not found — trying pdf2image fallback")
 
     # Fallback: use pdf2image (Python library, wraps poppler)
     try:

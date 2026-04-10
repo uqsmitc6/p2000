@@ -17,7 +17,7 @@ Detection heuristics:
 
 import re
 from handlers.base import SlideHandler
-from utils.extractor import extract_text_elements, extract_images
+from utils.extractor import extract_text_elements, extract_images, extract_shapes_with_text
 
 
 class SectionDividerHandler(SlideHandler):
@@ -126,24 +126,14 @@ class SectionDividerHandler(SlideHandler):
     def extract_content(self, slide, slide_index: int) -> dict:
         """
         Extract and classify content from an input section divider slide.
+
+        Uses shape-level grouping to properly separate:
+        - Section number (e.g. "01", "Session 1:")
+        - Title (largest/topmost shape)
+        - Description (remaining text)
+        - Footer (programme name)
         """
-        texts = extract_text_elements(slide)
-        images = extract_images(slide)
-
-        # Filter noise and expand multi-line
-        expanded = []
-        for t in texts:
-            lines = t["text"].split("\n") if "\n" in t["text"] else [t["text"]]
-            for line in lines:
-                line = line.strip()
-                if line:
-                    expanded.append({**t, "text": line})
-
-        filtered = [
-            t for t in expanded
-            if not any(p in t["text"].lower().strip() for p in self.PLACEHOLDER_NOISE)
-            and len(t["text"].strip()) > 1
-        ]
+        shapes = extract_shapes_with_text(slide)
 
         result = {
             "section_num": "",
@@ -152,41 +142,61 @@ class SectionDividerHandler(SlideHandler):
             "footer": "",
         }
 
+        if not shapes:
+            return result
+
+        # Filter noise
+        filtered = []
+        for s in shapes:
+            text = s["text"].strip()
+            if not text or len(text) <= 1:
+                continue
+            if any(p in text.lower() for p in self.PLACEHOLDER_NOISE):
+                continue
+            filtered.append(s)
+
         section_nums = []
         titles = []
-        descriptions = []
         footer_candidates = []
 
-        for t in filtered:
-            text = t["text"].strip()
+        for s in filtered:
+            text = s["text"].strip()
 
-            # Skip bare slide numbers (unpadded digits like "13", "54")
-            if re.match(r"^\d{1,3}$", text) and not re.match(r"^0\d", text):
+            # Handle multi-line shapes: check each line
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+            # Skip shapes that are just bare slide numbers
+            if len(lines) == 1 and re.match(r"^\d{1,3}$", lines[0]) and not re.match(r"^0\d", lines[0]):
                 continue
 
-            # Check if it's a section number/label (zero-padded or labelled)
-            if any(re.search(p, text) for p in self.SECTION_NUM_PATTERNS):
-                section_nums.append(t)
+            # Check if any line is a section number/label
+            is_section_num = False
+            for line in lines:
+                if any(re.search(p, line) for p in self.SECTION_NUM_PATTERNS):
+                    is_section_num = True
+                    section_nums.append({"text": line, **s})
+                    break
+
+            if is_section_num:
                 continue
 
-            # Check if it looks like a footer (programme name, CRICOS, etc.)
+            # Check if it looks like a footer
             if self._is_footer_text(text):
-                footer_candidates.append(t)
+                footer_candidates.append(s)
                 continue
 
-            # Remaining: title or description candidates
-            titles.append(t)
+            # Remaining: title or description
+            titles.append(s)
 
-        # Classify title vs description:
-        # Largest font or first substantive text → title
-        # Remaining → description
-        titles.sort(key=lambda t: (t["font_size"] or 0), reverse=True)
+        # Title: shape with largest font, or topmost shape
+        titles.sort(key=lambda s: (s["font_size"] or 0), reverse=True)
 
         if titles:
             result["title"] = titles[0]["text"]
         if len(titles) >= 2:
             # Join remaining as description
-            result["description"] = "\n".join(t["text"] for t in titles[1:])
+            desc_shapes = sorted(titles[1:], key=lambda s: (s["top"], s["left"]))
+            result["description"] = "\n".join(s["text"] for s in desc_shapes)
 
         # Section number
         if section_nums:
@@ -200,14 +210,19 @@ class SectionDividerHandler(SlideHandler):
 
     def _is_footer_text(self, text: str) -> bool:
         """Check if text looks like a footer/programme name."""
-        lower = text.lower()
         footer_patterns = [
-            r"(?i)cricos", r"(?i)^uq\s", r"(?i)university\s+of\s+queensland",
-            r"(?i)executive\s+education", r"(?i)business\s+school",
-            r"(?i)^leading\s", r"(?i)^think\s+and\s+act",
-            r"(?i)^climate\s+finance", r"(?i)^negotiat",
+            r"(?i)cricos",
+            r"(?i)^uq\s",
+            r"(?i)university\s+of\s+queensland",
+            r"(?i)executive\s+education",
+            r"(?i)business\s+school",
             r"(?i)hbis\s+innovation",
+            r"(?i)^presentation\s+title",
         ]
+        # Only match if the text is also short (footers are typically
+        # brief programme names, not slide content)
+        if len(text) > 60:
+            return False
         return any(re.search(p, text) for p in footer_patterns)
 
     # --- Output ---

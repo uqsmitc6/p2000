@@ -22,7 +22,7 @@ Design concerns (future):
 
 import re
 from handlers.base import SlideHandler
-from utils.extractor import extract_text_elements, extract_images
+from utils.extractor import extract_text_elements, extract_images, extract_shapes_with_text
 
 
 class TitleContentHandler(SlideHandler):
@@ -99,29 +99,13 @@ class TitleContentHandler(SlideHandler):
     def extract_content(self, slide, slide_index: int) -> dict:
         """
         Extract title, optional subtitle, and body content from a slide.
+
+        Strategy:
+        1. Use source placeholder indices if available — idx 0/3/15 = title,
+           idx 1/10 = content body. This is the most reliable signal.
+        2. Fall back to font size / position heuristics for non-placeholder shapes.
         """
-        texts = extract_text_elements(slide)
-
-        # Expand and filter
-        expanded = []
-        for t in texts:
-            lines = t["text"].split("\n") if "\n" in t["text"] else [t["text"]]
-            for line in lines:
-                line = line.strip()
-                if line:
-                    expanded.append({**t, "text": line})
-
-        filtered = [
-            t for t in expanded
-            if not any(p in t["text"].lower().strip() for p in self.PLACEHOLDER_NOISE)
-            and len(t["text"].strip()) > 0
-        ]
-
-        # Skip bare slide numbers
-        filtered = [
-            t for t in filtered
-            if not (re.match(r"^\d{1,3}$", t["text"].strip()) and len(t["text"].strip()) <= 3)
-        ]
+        shapes = extract_shapes_with_text(slide)
 
         result = {
             "title": "",
@@ -130,52 +114,114 @@ class TitleContentHandler(SlideHandler):
             "footer": "",
         }
 
-        # Separate footer-like text
-        content_texts = []
-        for t in filtered:
-            if self._is_footer_text(t["text"]):
-                if not result["footer"]:
-                    result["footer"] = t["text"]
-            else:
-                content_texts.append(t)
-
-        if not content_texts:
+        if not shapes:
             return result
 
-        # Classification strategy:
-        # 1. Group texts by their shape position (top coordinate)
-        # 2. The topmost short text → title
-        # 3. If there's a second short text near the top → subtitle
-        # 4. Everything else → body content
+        # Filter out noise, bare slide numbers, and image license text
+        filtered = []
+        for s in shapes:
+            text = s["text"].strip()
+            if not text:
+                continue
+            if any(p in text.lower() for p in self.PLACEHOLDER_NOISE):
+                continue
+            if re.match(r"^\d{1,3}$", text) and len(text) <= 3:
+                continue
+            if self._is_image_caption(text):
+                continue
+            filtered.append(s)
 
-        # Sort by vertical position
-        content_texts.sort(key=lambda t: (t["top"], t["left"]))
+        if not filtered:
+            return result
 
-        # Title: largest font, or topmost text if fonts are similar
-        by_font = sorted(content_texts, key=lambda t: (t["font_size"] or 0), reverse=True)
-        result["title"] = by_font[0]["text"]
+        # --- Separate by role using placeholder indices ---
+        title_shape = None
+        subtitle_shape = None
+        body_shapes = []
+        footer_text = ""
 
-        # Remaining texts
-        remaining = [t for t in content_texts if t["text"] != result["title"]]
+        for s in filtered:
+            if s["is_placeholder"]:
+                idx = s["shape_idx"]
+                if idx in (0, 3, 15):
+                    # TITLE / CENTER_TITLE
+                    title_shape = s
+                elif idx in (1, 10):
+                    # BODY / CONTENT
+                    body_shapes.append(s)
+                elif idx in (17,):
+                    # FOOTER
+                    if not footer_text:
+                        footer_text = s["text"]
+                elif idx in (18,):
+                    # SLIDE NUMBER — skip
+                    pass
+                else:
+                    # Unknown placeholder — treat as body
+                    body_shapes.append(s)
+            elif self._is_footer_text(s["text"]):
+                if not footer_text:
+                    footer_text = s["text"]
+            else:
+                # Non-placeholder shapes go to body
+                body_shapes.append(s)
 
-        # Check if the second text looks like a subtitle
-        # (shorter, near the top, different from body content)
-        if remaining:
-            candidate = remaining[0]
-            # Subtitle heuristic: short, near top, and there's more content below
+        result["footer"] = footer_text
+
+        # --- Fallback title detection if no placeholder found ---
+        if not title_shape and body_shapes:
+            # Priority 1: Shape with largest font size
+            with_font = [s for s in body_shapes if s["font_size"]]
+            if with_font:
+                candidate = max(with_font, key=lambda s: s["font_size"])
+                # Only promote to title if it's reasonably short
+                if len(candidate["text"]) < 120:
+                    title_shape = candidate
+                    body_shapes = [s for s in body_shapes if s is not title_shape]
+
+            # Priority 2: Topmost short shape
+            if not title_shape:
+                sorted_by_top = sorted(body_shapes, key=lambda s: s["top"])
+                for s in sorted_by_top:
+                    if len(s["text"]) < 120:
+                        title_shape = s
+                        body_shapes = [bs for bs in body_shapes if bs is not s]
+                        break
+
+        if title_shape:
+            result["title"] = title_shape["text"]
+
+        # --- Identify subtitle ---
+        # Sort body shapes by vertical position
+        body_shapes.sort(key=lambda s: (s["top"], s["left"]))
+
+        if body_shapes and title_shape:
+            candidate = body_shapes[0]
             is_short = len(candidate["text"]) < 100
-            is_near_top = candidate["top"] < (slide.slide_height / 3) if hasattr(slide, 'slide_height') else True
-            has_more_content = len(remaining) > 1
+            is_near_top = candidate["top"] < (title_shape["top"] + title_shape["height"] * 2)
+            has_more_content = len(body_shapes) > 1
 
-            if is_short and has_more_content:
+            if is_short and is_near_top and has_more_content:
                 result["subtitle"] = candidate["text"]
-                remaining = remaining[1:]
+                body_shapes = body_shapes[1:]
 
-        # Body content: join remaining texts
-        if remaining:
-            result["content"] = "\n".join(t["text"] for t in remaining)
+        # --- Body content ---
+        if body_shapes:
+            result["content"] = "\n".join(s["text"] for s in body_shapes)
 
         return result
+
+    def _is_image_caption(self, text: str) -> bool:
+        """Check if text is an image license/caption that should be filtered."""
+        caption_patterns = [
+            r"(?i)image\s+licensed\s+through",
+            r"(?i)adobe\s+stock[:\s]+\d",
+            r"(?i)shutterstock[:\s]+\d",
+            r"(?i)getty\s+images",
+            r"(?i)©\s*\d{4}",
+            r"(?i)source:\s*(http|www)",
+        ]
+        return any(re.search(p, text) for p in caption_patterns)
 
     def _is_footer_text(self, text: str) -> bool:
         """Check if text looks like a footer/programme name."""

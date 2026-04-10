@@ -6,7 +6,17 @@ Optionally uses Claude Vision API for smarter slide classification.
 """
 
 import os
+import logging
 import streamlit as st
+
+# --- Logging setup ---
+# Logs go to stdout → visible in Render's log viewer
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("uqslide.app")
 
 # --- Page config ---
 st.set_page_config(
@@ -79,6 +89,19 @@ with st.expander("Supported slide types"):
 Slides that don't match a known type will be skipped and listed.
     """)
 
+def _get_title(detail: dict) -> str:
+    """Extract a display title from a report detail entry."""
+    content = detail.get("content", {})
+    if not content:
+        return detail.get("preview", "")
+    return (
+        content.get("title", "") or
+        content.get("section_num", "") or
+        content.get("name", "") or
+        detail.get("preview", "")
+    )[:60]
+
+
 # --- File upload ---
 uploaded_file = st.file_uploader(
     "Upload your PowerPoint file",
@@ -91,8 +114,10 @@ if uploaded_file is not None:
     input_filename = uploaded_file.name
 
     st.markdown(f"**Uploaded:** `{input_filename}` ({len(input_bytes) / 1024:.0f} KB)")
+    logger.info("File uploaded: %s (%d KB)", input_filename, len(input_bytes) // 1024)
 
     if st.button("Convert presentation", type="primary"):
+        logger.info("Conversion started: %s (API=%s)", input_filename, bool(api_key))
         status_area = st.empty()
 
         def update_status(msg):
@@ -178,22 +203,22 @@ if uploaded_file is not None:
                                 f"- **Slide {d['slide']}**: {preview}{reason_str}"
                             )
 
+                # --- Errors ---
+                errors = report.get("errors", [])
+                if errors:
+                    with st.expander(f"Errors ({len(errors)})", expanded=True):
+                        st.warning(
+                            "Some issues occurred during conversion. "
+                            "The output may be incomplete."
+                        )
+                        for err in errors:
+                            st.markdown(f"- {err}")
+                    logger.warning("Conversion completed with %d errors", len(errors))
+
             except Exception as e:
+                logger.error("Conversion failed: %s", e, exc_info=True)
                 st.error(f"Something went wrong: {str(e)}")
                 st.exception(e)
-
-
-def _get_title(detail: dict) -> str:
-    """Extract a display title from a report detail entry."""
-    content = detail.get("content", {})
-    if not content:
-        return detail.get("preview", "")
-    return (
-        content.get("title", "") or
-        content.get("section_num", "") or
-        content.get("name", "") or
-        detail.get("preview", "")
-    )[:60]
 
 
 # --- Footer ---

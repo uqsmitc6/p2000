@@ -22,6 +22,9 @@ Requires: LibreOffice (for rendering), anthropic SDK (for API calls)
 
 import base64
 import json
+import logging
+
+logger = logging.getLogger("uqslide.classifier")
 
 
 # Available layout types and their descriptions — used in the prompt
@@ -39,12 +42,53 @@ LAYOUT_DESCRIPTIONS = {
         "max, no bullet points or body content. Often has a distinctive "
         "background colour or large typography."
     ),
+    "Text with Image": (
+        "A content slide with text on one side and an image/photo on the other. "
+        "The image takes up a significant portion of the slide (roughly 1/3 to 2/3). "
+        "The text side typically has a title and some body content. The image may "
+        "be a photograph, illustration, stock image, or diagram. Distinguishable "
+        "from Title and Content by the prominent placement of a large image "
+        "alongside text, rather than text filling the full width."
+    ),
+    "Title and Table": (
+        "A slide containing a data table. The table has visible rows and columns "
+        "with text in cells. May also have a title above the table. Tables might "
+        "contain schedules, comparison matrices, data summaries, rubrics, or "
+        "structured information. The table is the dominant element on the slide."
+    ),
+    "Two Content": (
+        "A slide with two distinct columns of content side by side, with roughly "
+        "EQUAL column widths. Each column may contain bullet points, text, or "
+        "lists. Often used for comparisons, pros/cons, before/after, or two "
+        "parallel concepts. The key visual signal is two equally-sized text areas "
+        "arranged horizontally with a title above."
+    ),
+    "Split Content": (
+        "A slide with two columns of UNEQUAL width — one narrow (roughly 1/3) "
+        "and one wide (roughly 2/3). The narrow column usually has a key concept, "
+        "summary, or introduction, while the wide column has detailed content. "
+        "Distinguished from Two Content by the clear asymmetry in column widths."
+    ),
+    "Quote": (
+        "A quote slide featuring a prominent quotation with attribution. "
+        "The quote is typically in large text, often with quotation marks, and "
+        "the author/source is shown below in smaller text. May have a background "
+        "image. Very sparse — usually just the quote and attribution, no bullets "
+        "or body content."
+    ),
+    "Title Only": (
+        "A slide with just a title and visual content (images, diagrams, charts, "
+        "flowcharts, process diagrams) that fills the content area. Distinguished "
+        "from Title and Content by having minimal or no body TEXT — the content "
+        "is primarily visual. The title is the only meaningful text element."
+    ),
     "Title and Content": (
         "A standard content slide with a title at the top and body content below. "
         "The body may contain bullet points, paragraphs, references, discussion "
-        "questions, activity instructions, images, diagrams, or any other "
-        "teaching content. This is the most common slide type — the default for "
-        "anything that isn't clearly a cover, divider, or closing slide."
+        "questions, activity instructions, or any other teaching content. "
+        "This is the most common slide type — the default for anything that "
+        "isn't clearly a cover, divider, closing slide, image slide, table, "
+        "two-column, or quote slide."
     ),
     "Thank You": (
         "A closing/contact slide at the end of the presentation. Contains "
@@ -75,7 +119,7 @@ Context:
 Based on the visual appearance, layout, and content of this slide, classify it.
 
 Respond with ONLY a JSON object (no markdown, no code fences):
-{{"type": "<one of: Cover 1, Section Divider, Title and Content, Thank You, Skip>", "confidence": <0.0 to 1.0>, "reason": "<brief explanation>"}}"""
+{{"type": "<one of: Cover 1, Section Divider, Text with Image, Title and Table, Two Content, Split Content, Quote, Title Only, Title and Content, Thank You, Skip>", "confidence": <0.0 to 1.0>, "reason": "<brief explanation>"}}"""
 
 
 def classify_slide_with_api(
@@ -105,6 +149,9 @@ def classify_slide_with_api(
     try:
         import anthropic
 
+        logger.info("Classifying slide %d/%d via %s (%s)",
+                     slide_index + 1, total_slides, model,
+                     "vision" if slide_image else "text-only")
         client = anthropic.Anthropic(api_key=api_key)
 
         layout_descs = "\n".join(
@@ -168,6 +215,10 @@ def classify_slide_with_api(
         if result.get("type") not in valid_types:
             return {"type": None, "error": f"Invalid type: {result.get('type')}"}
 
+        logger.info("Slide %d classified as '%s' (%.2f): %s",
+                     slide_index + 1, result["type"],
+                     float(result.get("confidence", 0.8)),
+                     result.get("reason", ""))
         return {
             "type": result["type"],
             "confidence": float(result.get("confidence", 0.8)),
@@ -175,8 +226,11 @@ def classify_slide_with_api(
         }
 
     except json.JSONDecodeError as e:
+        logger.error("Slide %d: failed to parse API response: %s | raw: %s",
+                      slide_index + 1, e, response_text[:200] if 'response_text' in dir() else "N/A")
         return {"type": None, "error": f"Failed to parse API response: {e}"}
     except Exception as e:
+        logger.error("Slide %d: API call failed: %s", slide_index + 1, e, exc_info=True)
         return {"type": None, "error": f"API call failed: {e}"}
 
 
@@ -227,7 +281,7 @@ Text elements (in order of position, top to bottom):
 {chr(10).join(text_lines)}
 
 Respond with ONLY a JSON object (no markdown, no code fences):
-{{"type": "<one of: Cover 1, Section Divider, Title and Content, Thank You, Skip>", "confidence": <0.0 to 1.0>, "reason": "<brief explanation>"}}"""
+{{"type": "<one of: Cover 1, Section Divider, Text with Image, Title and Table, Two Content, Split Content, Quote, Title Only, Title and Content, Thank You, Skip>", "confidence": <0.0 to 1.0>, "reason": "<brief explanation>"}}"""
 
     return prompt
 

@@ -19,10 +19,52 @@ def open_template() -> Presentation:
 def add_slide_from_layout(prs: Presentation, layout_index: int):
     """
     Add a new slide using the specified layout index from the template.
+    Also activates footer and slide number placeholders from the layout
+    (python-pptx doesn't inherit these automatically).
     Returns the new slide object.
     """
     layout = prs.slide_masters[0].slide_layouts[layout_index]
-    return prs.slides.add_slide(layout)
+    slide = prs.slides.add_slide(layout)
+
+    # Activate footer/slide number placeholders from layout
+    _activate_layout_placeholders(slide, layout, ph_types=["ftr", "sldNum"])
+
+    return slide
+
+
+def _activate_layout_placeholders(slide, layout, ph_types):
+    """
+    Copy placeholder shapes from the layout XML to the slide XML.
+    This makes inherited footer/slide number placeholders editable.
+
+    Args:
+        slide: the new slide
+        layout: the slide layout
+        ph_types: list of placeholder type strings to activate
+                  ("ftr" = footer, "sldNum" = slide number)
+    """
+    from copy import deepcopy
+    from lxml import etree
+
+    nsmap = {
+        'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+        'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
+    }
+
+    # Find existing placeholder types on the slide
+    existing_types = set()
+    for sp in slide.shapes._spTree.findall('.//p:sp', nsmap):
+        ph = sp.find('.//p:nvSpPr/p:nvPr/p:ph', nsmap)
+        if ph is not None:
+            existing_types.add(ph.get('type'))
+
+    # Copy missing placeholders from layout
+    for sp in layout.placeholders._element.getparent().findall('.//p:sp', nsmap):
+        ph = sp.find('.//p:nvSpPr/p:nvPr/p:ph', nsmap)
+        if ph is not None:
+            ph_type = ph.get('type')
+            if ph_type in ph_types and ph_type not in existing_types:
+                slide.shapes._spTree.append(deepcopy(sp))
 
 
 def delete_slide(prs: Presentation, slide_index: int):

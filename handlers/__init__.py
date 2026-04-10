@@ -4,6 +4,12 @@ from handlers.cover1 import Cover1Handler
 from handlers.section_divider import SectionDividerHandler
 from handlers.title_content import TitleContentHandler
 from handlers.thank_you import ThankYouHandler
+from handlers.text_image import TextImageHandler
+from handlers.title_table import TitleTableHandler
+from handlers.two_content import TwoContentHandler
+from handlers.quote import QuoteHandler
+from handlers.title_only import TitleOnlyHandler
+from handlers.split_content import SplitContentHandler
 
 # Registry of all available handlers.
 # Order matters for tie-breaking: more specific handlers are checked first.
@@ -12,6 +18,12 @@ HANDLER_REGISTRY = {
     "Cover 1": Cover1Handler,
     "Section Divider": SectionDividerHandler,
     "Thank You": ThankYouHandler,
+    "Text with Image": TextImageHandler,
+    "Title and Table": TitleTableHandler,
+    "Two Content": TwoContentHandler,
+    "Split Content": SplitContentHandler,
+    "Quote": QuoteHandler,
+    "Title Only": TitleOnlyHandler,
     "Title and Content": TitleContentHandler,
 }
 
