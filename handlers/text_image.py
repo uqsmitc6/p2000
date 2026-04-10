@@ -85,6 +85,22 @@ class TextImageHandler(SlideHandler):
         if not real_images:
             return 0.0
 
+        # Filter out very large images (likely background/decorative).
+        # Slide dimensions: 12192000 x 6858000 EMU.
+        # If the largest image spans >70% of the slide width AND >50% of
+        # height, it's probably decorative — not a side-by-side content image.
+        SLIDE_W = 12192000
+        SLIDE_H = 6858000
+        content_images = [
+            img for img in real_images
+            if not (
+                (img.get("width") or 0) > SLIDE_W * 0.7
+                and (img.get("height") or 0) > SLIDE_H * 0.5
+            )
+        ]
+        if not content_images:
+            return 0.0  # Only large decorative images → not Text with Image
+
         texts = extract_text_elements(slide)
         if not texts:
             return 0.0

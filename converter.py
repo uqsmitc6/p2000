@@ -96,7 +96,33 @@ def convert_presentation(
     output_prs = open_template()
     new_slides_added = 0
 
+    # --- Auto-insert Acknowledgement of Country as slide 2 ---
+    # Pre-scan source to find (and later skip) any existing AoC slides
+    aoc_handler = handlers.get("Acknowledgement of Country")
+    aoc_source_indices = set()  # source slide indices to skip (already consumed)
+    if aoc_handler:
+        for i, s in enumerate(input_prs.slides):
+            if aoc_handler.detect(s, i) >= 0.9:
+                aoc_source_indices.add(i)
+        # AoC will be inserted after the cover slide is processed (see below)
+    aoc_inserted = False
+
     for slide_idx, slide in enumerate(input_prs.slides):
+
+        # Skip source AoC slides — we auto-insert a branded one
+        if slide_idx in aoc_source_indices:
+            logger.info("Slide %d: skipping existing AoC (will auto-insert branded version)", slide_idx + 1)
+            report["details"].append({
+                "slide": slide_idx + 1,
+                "status": "converted",
+                "handler": "Acknowledgement of Country",
+                "confidence": 0.95,
+                "content": None,
+                "preview": "Acknowledgement of Country (replaced with branded version)",
+                "all_scores": {},
+                "classification_method": "auto",
+            })
+            continue
 
         if progress_callback:
             progress_callback(
@@ -183,6 +209,31 @@ def convert_presentation(
                 )
 
                 new_slides_added += 1
+
+                # Auto-insert AoC after cover slide
+                if not aoc_inserted and best_handler.name == "Cover 1" and aoc_handler:
+                    try:
+                        aoc_content = aoc_handler._get_standard_content()
+                        aoc_slide = add_slide_from_layout(output_prs, aoc_handler.layout_index)
+                        aoc_handler.fill_slide(aoc_slide, aoc_content)
+                        _fill_footer_and_slide_num(aoc_slide, aoc_handler, programme_name, 2)
+                        new_slides_added += 1
+                        aoc_inserted = True
+                        report["slides_converted"] += 1
+                        report["details"].append({
+                            "slide": "2 (auto)",
+                            "status": "converted",
+                            "handler": "Acknowledgement of Country",
+                            "confidence": 1.0,
+                            "content": aoc_content,
+                            "preview": "Acknowledgement of Country (auto-inserted)",
+                            "all_scores": {},
+                            "classification_method": "auto",
+                        })
+                        logger.info("Auto-inserted Acknowledgement of Country as slide 2")
+                    except Exception as e:
+                        logger.error("Failed to insert AoC slide: %s", e)
+                        report["errors"].append(f"AoC auto-insert failed: {e}")
 
                 if best_confidence >= CONFIDENT_THRESHOLD:
                     status = "converted"

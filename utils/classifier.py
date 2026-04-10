@@ -96,11 +96,24 @@ LAYOUT_DESCRIPTIONS = {
         "May include presenter name, email, phone number, or job title. "
         "Often sparse with large text."
     ),
+    "Acknowledgement of Country": (
+        "A slide acknowledging Traditional Owners and custodians of the land. "
+        "Contains phrases like 'Acknowledgement of Country', 'Traditional Owners', "
+        "'Traditional Custodians', 'Elders past', or 'custodianship of the lands'. "
+        "This is automatically replaced with a standard branded version."
+    ),
+    "References": (
+        "A slide listing academic references, citations, bibliography, image credits, "
+        "or sources. Contains DOIs, journal names, author names with years (2019), "
+        "'et al.', 'Vol.', 'pp.', or image credit lines (Adobe Stock, Unsplash, etc.). "
+        "Title is typically 'References', 'Selected References', 'Bibliography', "
+        "'Sources', 'Image Credits', or 'Further Reading'."
+    ),
     "Skip": (
         "A slide that doesn't fit any of the above types and should be "
         "excluded from the output. Examples: blank slides, housekeeping "
         "slides (restrooms, WiFi, Zoom details), break slides (Morning Tea, "
-        "Lunch), acknowledgement of country, or slides with only images/logos "
+        "Lunch), or slides with only images/logos "
         "and no meaningful teaching content."
     ),
 }
@@ -119,7 +132,7 @@ Context:
 Based on the visual appearance, layout, and content of this slide, classify it.
 
 Respond with ONLY a JSON object (no markdown, no code fences):
-{{"type": "<one of: Cover 1, Section Divider, Text with Image, Title and Table, Two Content, Split Content, Quote, Title Only, Title and Content, Thank You, Skip>", "confidence": <0.0 to 1.0>, "reason": "<brief explanation>"}}"""
+{{"type": "<one of: Cover 1, Acknowledgement of Country, Section Divider, Text with Image, Title and Table, Two Content, Split Content, Quote, Title Only, Title and Content, References, Thank You, Skip>", "confidence": <0.0 to 1.0>, "reason": "<brief explanation>"}}"""
 
 
 def classify_slide_with_api(
@@ -281,7 +294,7 @@ Text elements (in order of position, top to bottom):
 {chr(10).join(text_lines)}
 
 Respond with ONLY a JSON object (no markdown, no code fences):
-{{"type": "<one of: Cover 1, Section Divider, Text with Image, Title and Table, Two Content, Split Content, Quote, Title Only, Title and Content, Thank You, Skip>", "confidence": <0.0 to 1.0>, "reason": "<brief explanation>"}}"""
+{{"type": "<one of: Cover 1, Acknowledgement of Country, Section Divider, Text with Image, Title and Table, Two Content, Split Content, Quote, Title Only, Title and Content, References, Thank You, Skip>", "confidence": <0.0 to 1.0>, "reason": "<brief explanation>"}}"""
 
     return prompt
 

@@ -9,7 +9,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -85,6 +85,7 @@ else:
 with st.expander("Supported slide types"):
     st.markdown("""
 - **Cover 1** — Programme title slide (first slide)
+- **Acknowledgement of Country** — Auto-inserted as slide 2 with standard UQ wording
 - **Section Divider** — Section break with number and title
 - **Title and Content** — Standard content slide (default fallback)
 - **Text with Image** — Text alongside an image (auto-selects 1/3, 1/2, or 2/3 variant)
@@ -93,6 +94,7 @@ with st.expander("Supported slide types"):
 - **Title and Table** — Slide with a data table
 - **Title Only** — Title with image/diagram, minimal body text
 - **Quote** — Quotation with attribution
+- **References** — Academic citations, image credits, and bibliography slides
 - **Thank You** — Closing/contact slide (last slide)
 
 Slides that don't match a known type will be skipped and listed.

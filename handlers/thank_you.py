@@ -37,12 +37,14 @@ class ThankYouHandler(SlideHandler):
 
     # --- Detection patterns ---
 
+    # Closing patterns — these should match text where the closing phrase
+    # is the PRIMARY content, not buried inside a longer sentence.
     CLOSING_PATTERNS = [
-        r"(?i)thank\s*you",
-        r"(?i)^thanks\b",
+        r"(?i)^thank\s*you[!.\s]*$",     # "Thank you" as the whole text
+        r"(?i)^thanks[!.\s]*$",           # "Thanks" as the whole text
         r"(?i)^questions[\s,?]*$",
         r"(?i)^q\s*(&|and)\s*a\b",
-        r"(?i)^contact\b",
+        r"(?i)^contact\s*$",              # "Contact" as the whole text
         r"(?i)^get\s+in\s+touch",
         r"(?i)^any\s+questions",
     ]
@@ -85,12 +87,19 @@ class ThankYouHandler(SlideHandler):
         has_email = bool(re.search(self.EMAIL_PATTERN, all_text))
         has_phone = bool(re.search(self.PHONE_PATTERN, all_text))
 
+        # Disqualifier: if any single text element is long (>100 chars),
+        # this is a content slide, not a closing slide
+        has_long_text = any(len(t["text"].strip()) > 100 for t in meaningful)
+
         # Layout name signal
         layout_name = slide.slide_layout.name.lower()
         is_thank_layout = "thank" in layout_name or "contact" in layout_name
 
         if is_thank_layout:
             return 0.95
+
+        if has_long_text:
+            return 0.05  # Content slides with long text are not Thank You
 
         if has_closing and (has_email or has_phone):
             return 0.9

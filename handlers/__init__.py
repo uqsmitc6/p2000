@@ -10,11 +10,14 @@ from handlers.two_content import TwoContentHandler
 from handlers.quote import QuoteHandler
 from handlers.title_only import TitleOnlyHandler
 from handlers.split_content import SplitContentHandler
+from handlers.acknowledgement import AcknowledgementHandler
+from handlers.references import ReferencesHandler
 
 # Registry of all available handlers.
 # Order matters for tie-breaking: more specific handlers are checked first.
 # Title and Content is intentionally last — it's the fallback.
 HANDLER_REGISTRY = {
+    "Acknowledgement of Country": AcknowledgementHandler,
     "Cover 1": Cover1Handler,
     "Section Divider": SectionDividerHandler,
     "Thank You": ThankYouHandler,
@@ -23,6 +26,7 @@ HANDLER_REGISTRY = {
     "Two Content": TwoContentHandler,
     "Split Content": SplitContentHandler,
     "Quote": QuoteHandler,
+    "References": ReferencesHandler,
     "Title Only": TitleOnlyHandler,
     "Title and Content": TitleContentHandler,
 }
