@@ -9,6 +9,8 @@ import os
 import logging
 import streamlit as st
 
+APP_VERSION = "0.5.0"
+
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
 logging.basicConfig(
@@ -45,6 +47,7 @@ st.markdown("""
 
 # --- Header ---
 st.title("UQ Slide Converter")
+st.caption(f"v{APP_VERSION}")
 st.markdown(
     "Upload a PowerPoint file and get a brand-compliant version using the "
     "official UQ Business School template."
@@ -83,7 +86,13 @@ with st.expander("Supported slide types"):
     st.markdown("""
 - **Cover 1** — Programme title slide (first slide)
 - **Section Divider** — Section break with number and title
-- **Title and Content** — Standard content slide (default)
+- **Title and Content** — Standard content slide (default fallback)
+- **Text with Image** — Text alongside an image (auto-selects 1/3, 1/2, or 2/3 variant)
+- **Two Content** — Two equal columns of text
+- **Split Content** — Asymmetric columns (1/3 + 2/3 or 2/3 + 1/3)
+- **Title and Table** — Slide with a data table
+- **Title Only** — Title with image/diagram, minimal body text
+- **Quote** — Quotation with attribution
 - **Thank You** — Closing/contact slide (last slide)
 
 Slides that don't match a known type will be skipped and listed.
