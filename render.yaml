@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: uq-slide-converter
+    runtime: docker
+    plan: free
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
