@@ -237,6 +237,9 @@ class QuoteHandler(SlideHandler):
     def fill_slide(self, slide, content: dict) -> None:
         """
         Fill quote placeholders. Optionally insert background image.
+        If no source image, generate a UQ purple gradient background so
+        the white quote text is readable (the template picture placeholder
+        renders as grey when empty).
         NEVER set font properties.
         """
         import io
@@ -250,10 +253,59 @@ class QuoteHandler(SlideHandler):
         if content.get("attribution") and self.PH_ATTRIBUTION in placeholders:
             placeholders[self.PH_ATTRIBUTION].text = content["attribution"]
 
-        # Background picture
-        if content.get("image_blob") and self.PH_PICTURE in placeholders:
-            image_stream = io.BytesIO(content["image_blob"])
-            placeholders[self.PH_PICTURE].insert_picture(image_stream)
+        # Background picture — use source image or generate default dark bg
+        if self.PH_PICTURE in placeholders:
+            if content.get("image_blob"):
+                image_stream = io.BytesIO(content["image_blob"])
+                placeholders[self.PH_PICTURE].insert_picture(image_stream)
+            else:
+                # No source image — fill with UQ purple gradient
+                default_bg = self._generate_default_background()
+                placeholders[self.PH_PICTURE].insert_picture(io.BytesIO(default_bg))
+
+    @staticmethod
+    def _generate_default_background() -> bytes:
+        """
+        Generate a 1920x1080 dark purple gradient PNG for quote backgrounds.
+        Uses UQ brand purple (#51247A) transitioning to a deeper shade.
+        """
+        try:
+            from PIL import Image, ImageDraw
+            width, height = 1920, 1080
+            img = Image.new("RGB", (width, height))
+            draw = ImageDraw.Draw(img)
+
+            # UQ purple gradient: top-left lighter (#51247A) to bottom-right darker (#2B0E42)
+            r1, g1, b1 = 81, 36, 122   # #51247A — UQ purple
+            r2, g2, b2 = 43, 14, 66    # #2B0E42 — deep purple
+
+            for y in range(height):
+                t = y / height
+                r = int(r1 + (r2 - r1) * t)
+                g = int(g1 + (g2 - g1) * t)
+                b = int(b1 + (b2 - b1) * t)
+                draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            return buf.getvalue()
+        except ImportError:
+            # Pillow not available — create a minimal 1x1 purple PNG
+            # This is a valid 1x1 PNG with colour #51247A
+            import struct
+            import zlib
+
+            def _create_tiny_png(r, g, b):
+                raw = b'\x00' + bytes([r, g, b])
+                compressed = zlib.compress(raw)
+                ihdr = struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)
+                chunks = b''
+                for ctype, data in [(b'IHDR', ihdr), (b'IDAT', compressed), (b'IEND', b'')]:
+                    crc = zlib.crc32(ctype + data) & 0xFFFFFFFF
+                    chunks += struct.pack('>I', len(data)) + ctype + data + struct.pack('>I', crc)
+                return b'\x89PNG\r\n\x1a\n' + chunks
+
+            return _create_tiny_png(81, 36, 122)
 
     def get_placeholder_map(self) -> dict:
         return {
