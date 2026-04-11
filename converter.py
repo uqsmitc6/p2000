@@ -78,7 +78,7 @@ def convert_presentation(
     if api_key:
         if progress_callback:
             progress_callback("Rendering slides to images for AI classification...")
-        slide_images = _render_slide_images(input_bytes)
+        slide_images, render_diag = _render_slide_images(input_bytes)
         if slide_images:
             logger.info("Rendered %d slide images for Vision classification", len(slide_images))
             if progress_callback:
@@ -87,7 +87,9 @@ def convert_presentation(
                 )
         else:
             logger.warning("Slide rendering failed — falling back to text-only classification")
-            report["errors"].append("Slide rendering failed. Used text-only classification fallback.")
+            report["errors"].append(
+                f"Slide rendering failed: {render_diag}. Used text-only classification fallback."
+            )
             if progress_callback:
                 progress_callback(
                     "Could not render slide images. Using text-only fallback."
@@ -347,26 +349,28 @@ def convert_presentation(
     return output_buffer.getvalue(), report
 
 
-def _render_slide_images(input_bytes: bytes) -> dict:
+def _render_slide_images(input_bytes: bytes) -> tuple[dict, str]:
     """
     Render all slides to PNG images using LibreOffice.
 
     Returns:
-        dict mapping slide_index (0-based) → PNG bytes
+        Tuple of (dict mapping slide_index → PNG bytes, diagnostic_message)
         Empty dict if rendering fails.
     """
     try:
         from utils.renderer import render_slides_to_images, is_libreoffice_available
         if not is_libreoffice_available():
-            logger.error("LibreOffice not available — check Docker image has libreoffice-impress installed")
-            return {}
+            msg = "LibreOffice not available — check Docker image has libreoffice-impress installed"
+            logger.error(msg)
+            return {}, msg
         logger.info("LibreOffice available, starting render of %d bytes...", len(input_bytes))
-        images = render_slides_to_images(input_bytes, dpi=150)
-        logger.info("Render complete: %d slide images produced", len(images))
-        return {i: img for i, img in enumerate(images)}
+        images, diag = render_slides_to_images(input_bytes, dpi=150)
+        logger.info("Render complete: %d slide images produced. Diag: %s", len(images), diag)
+        return {i: img for i, img in enumerate(images)}, diag
     except Exception as e:
-        logger.error("Slide rendering failed: %s", e, exc_info=True)
-        return {}
+        msg = f"Slide rendering failed: {e}"
+        logger.error(msg, exc_info=True)
+        return {}, msg
 
 
 def _classify_with_api(slide, slide_index, total_slides, api_key, model,

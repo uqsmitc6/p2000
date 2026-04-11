@@ -9,7 +9,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.5.5"
+APP_VERSION = "0.5.6"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -178,91 +178,106 @@ if uploaded_file is not None:
 
                 status_area.empty()
 
-                total = len(report["details"])
-                converted = report["slides_converted"]
-                flagged = report["slides_flagged"]
-                skipped = report["slides_skipped"]
-                api_calls = report.get("api_calls", 0)
-
-                # --- Summary ---
-                cols = st.columns(4 if api_calls else 3)
-                cols[0].metric("Converted", converted)
-                cols[1].metric("Flagged", flagged)
-                cols[2].metric("Skipped", skipped)
-                if api_calls:
-                    cols[3].metric("AI calls", api_calls)
-
-                # --- Download ---
-                output_filename = input_filename.replace(".pptx", "_BRANDED.pptx")
-                st.download_button(
-                    label=f"Download {output_filename}",
-                    data=output_bytes,
-                    file_name=output_filename,
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                # Store results in session state so they persist across reruns
+                # (e.g., when the download button is clicked)
+                st.session_state["output_bytes"] = output_bytes
+                st.session_state["report"] = report
+                st.session_state["output_filename"] = input_filename.replace(
+                    ".pptx", "_BRANDED.pptx"
                 )
-
-                # --- Confident conversions ---
-                confident = [d for d in report["details"] if d["status"] == "converted"]
-                if confident:
-                    with st.expander(f"Converted slides ({len(confident)})", expanded=False):
-                        for d in confident:
-                            title = _get_title(d)
-                            method = d.get("classification_method", "heuristic")
-                            tag = " 🤖" if method == "api" else ""
-                            st.markdown(
-                                f"- **Slide {d['slide']}** → {d['handler']}{tag} — *{title}*"
-                            )
-
-                # --- Flagged slides ---
-                flagged_items = [d for d in report["details"] if d["status"] == "flagged"]
-                if flagged_items:
-                    with st.expander(f"Flagged for review ({len(flagged_items)})", expanded=True):
-                        st.warning(
-                            "These slides were converted but classification confidence was low. "
-                            "Check they've been assigned to the right layout."
-                        )
-                        for d in flagged_items:
-                            title = _get_title(d)
-                            conf = d.get("confidence", 0)
-                            method = d.get("classification_method", "heuristic")
-                            tag = " 🤖" if method == "api" else ""
-                            st.markdown(
-                                f"- **Slide {d['slide']}** → {d['handler']} "
-                                f"({conf:.0%}{tag}) — *{title}*"
-                            )
-
-                # --- Skipped slides ---
-                skipped_items = [d for d in report["details"] if d["status"] == "skipped"]
-                if skipped_items:
-                    with st.expander(f"Skipped — not recognised ({len(skipped_items)})", expanded=True):
-                        st.error(
-                            "These slides are **not included** in the output. "
-                            "They may need to be added manually."
-                        )
-                        for d in skipped_items:
-                            preview = d.get("preview", "(no text)")
-                            reason = d.get("api_reason", d.get("reason", ""))
-                            reason_str = f" — *{reason}*" if reason else ""
-                            st.markdown(
-                                f"- **Slide {d['slide']}**: {preview}{reason_str}"
-                            )
-
-                # --- Errors ---
-                errors = report.get("errors", [])
-                if errors:
-                    with st.expander(f"Errors ({len(errors)})", expanded=True):
-                        st.warning(
-                            "Some issues occurred during conversion. "
-                            "The output may be incomplete."
-                        )
-                        for err in errors:
-                            st.markdown(f"- {err}")
-                    logger.warning("Conversion completed with %d errors", len(errors))
 
             except Exception as e:
                 logger.error("Conversion failed: %s", e, exc_info=True)
                 st.error(f"Something went wrong: {str(e)}")
                 st.exception(e)
+
+# --- Display results from session state ---
+if "output_bytes" in st.session_state and "report" in st.session_state:
+    report = st.session_state["report"]
+    output_bytes = st.session_state["output_bytes"]
+    output_filename = st.session_state["output_filename"]
+
+    converted = report["slides_converted"]
+    flagged = report["slides_flagged"]
+    skipped = report["slides_skipped"]
+    api_calls = report.get("api_calls", 0)
+
+    # --- Summary ---
+    cols = st.columns(4 if api_calls else 3)
+    cols[0].metric("Converted", converted)
+    cols[1].metric("Flagged", flagged)
+    cols[2].metric("Skipped", skipped)
+    if api_calls:
+        cols[3].metric("AI calls", api_calls)
+
+    # --- Download ---
+    st.download_button(
+        label=f"Download {output_filename}",
+        data=output_bytes,
+        file_name=output_filename,
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+
+    # --- Confident conversions ---
+    confident = [d for d in report["details"] if d["status"] == "converted"]
+    if confident:
+        with st.expander(f"Converted slides ({len(confident)})", expanded=False):
+            for d in confident:
+                title = _get_title(d)
+                method = d.get("classification_method", "heuristic")
+                tag = " 🤖" if method == "api" else ""
+                st.markdown(
+                    f"- **Slide {d['slide']}** → {d['handler']}{tag} — *{title}*"
+                )
+
+    # --- Flagged slides ---
+    flagged_items = [d for d in report["details"] if d["status"] == "flagged"]
+    if flagged_items:
+        with st.expander(f"Flagged for review ({len(flagged_items)})", expanded=True):
+            st.warning(
+                "These slides were converted but classification confidence was low. "
+                "Check they've been assigned to the right layout."
+            )
+            for d in flagged_items:
+                title = _get_title(d)
+                conf = d.get("confidence", 0)
+                method = d.get("classification_method", "heuristic")
+                tag = " 🤖" if method == "api" else ""
+                st.markdown(
+                    f"- **Slide {d['slide']}** → {d['handler']} "
+                    f"({conf:.0%}{tag}) — *{title}*"
+                )
+
+    # --- Skipped slides ---
+    skipped_items = [d for d in report["details"] if d["status"] == "skipped"]
+    if skipped_items:
+        with st.expander(f"Skipped — not recognised ({len(skipped_items)})", expanded=True):
+            st.error(
+                "These slides are **not included** in the output. "
+                "They may need to be added manually."
+            )
+            for d in skipped_items:
+                preview = d.get("preview", "(no text)")
+                reason = d.get("api_reason", d.get("reason", ""))
+                reason_str = f" — *{reason}*" if reason else ""
+                st.markdown(
+                    f"- **Slide {d['slide']}**: {preview}{reason_str}"
+                )
+
+    # --- Errors ---
+    errors = report.get("errors", [])
+    if errors:
+        with st.expander(f"Errors ({len(errors)})", expanded=True):
+            st.warning(
+                "Some issues occurred during conversion. "
+                "The output may be incomplete."
+            )
+            for err in errors:
+                if "rendering failed" in err.lower():
+                    st.error(f"🖼️ {err}")
+                else:
+                    st.markdown(f"- {err}")
+            logger.warning("Conversion completed with %d errors", len(errors))
 
 
 # --- Footer ---
