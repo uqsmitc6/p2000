@@ -48,6 +48,17 @@ class QuoteHandler(SlideHandler):
         r'^["\u201c\u2018\u00ab].*["\u201d\u2019\u00bb]$', re.DOTALL
     )
 
+    # Patterns for INLINE quotes: lead-in text with embedded quote marks
+    # e.g., 'Customer experience is a "customer\'s journey..." (Author, Year)'
+    INLINE_QUOTE_PATTERN = re.compile(
+        r'["\u201c\u2018\u00ab].{20,}["\u201d\u2019\u00bb]', re.DOTALL
+    )
+
+    # Citation at end: (Author Year) or (Author Year, page)
+    CITATION_SUFFIX_PATTERN = re.compile(
+        r'\([A-Z][a-z]+.*?\d{4}.*?\)\s*$'
+    )
+
     # Patterns that suggest an attribution line
     ATTRIBUTION_PATTERNS = [
         r"^[-\u2013\u2014]\s*[A-Z]",        # Starts with dash + capitalised name
@@ -84,7 +95,9 @@ class QuoteHandler(SlideHandler):
 
         # Look for a text element that is a wrapped quote (starts AND ends with quote marks)
         has_wrapped_quote = False
+        has_inline_quote = False
         has_attribution = False
+        has_citation_suffix = False
         quote_text_len = 0
 
         for t in meaningful:
@@ -92,6 +105,11 @@ class QuoteHandler(SlideHandler):
             if self.WRAPPED_QUOTE_PATTERN.match(text):
                 has_wrapped_quote = True
                 quote_text_len = len(text)
+            elif self.INLINE_QUOTE_PATTERN.search(text):
+                has_inline_quote = True
+                quote_text_len = len(text)
+            if self.CITATION_SUFFIX_PATTERN.search(text):
+                has_citation_suffix = True
             for pattern in self.ATTRIBUTION_PATTERNS:
                 if re.search(pattern, text):
                     has_attribution = True
@@ -109,6 +127,17 @@ class QuoteHandler(SlideHandler):
         if has_wrapped_quote and len(meaningful) <= 2:
             if total_text < 250:
                 return 0.50
+
+        # Inline quote with citation: single text element containing
+        # quoted text + parenthetical citation on a sparse slide
+        if has_inline_quote and has_citation_suffix and len(meaningful) <= 2:
+            if total_text < 400:
+                return 0.65
+
+        # Inline quote with attribution as separate element
+        if has_inline_quote and has_attribution and len(meaningful) <= 3:
+            if total_text < 400:
+                return 0.60
 
         return 0.0
 

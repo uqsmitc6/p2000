@@ -63,7 +63,7 @@ class TitleOnlyHandler(SlideHandler):
         if not shapes:
             # No text at all — might be a blank or image-only slide
             if images:
-                return 0.30  # Has images but no text
+                return 0.50  # Has images but no text — Title Only is best fit
             return 0.0
 
         # Filter noise

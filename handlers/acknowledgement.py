@@ -39,10 +39,10 @@ AOC_TITLE = "Acknowledgement of Country"
 
 AOC_BODY = (
     "The University of Queensland (UQ) acknowledges the Traditional Owners "
-    "and their custodianship of the lands on which we meet.\n\n"
+    "and their custodianship of the lands on which we meet.\n"
     "We pay our respects to their Ancestors and their descendants, who "
-    "continue cultural and spiritual connections to Country.\n\n"
-    "We recognise their valuable contributions to Australian and global society.\n\n"
+    "continue cultural and spiritual connections to Country.\n"
+    "We recognise their valuable contributions to Australian and global society.\n"
     "Sovereignty was never ceded, and this always was and always will be "
     "Aboriginal land."
 )
@@ -121,9 +121,20 @@ class AcknowledgementHandler(SlideHandler):
         if self.PH_TITLE in placeholders:
             placeholders[self.PH_TITLE].text = content.get("title", AOC_TITLE)
 
-        # Body text
+        # Body text — set paragraph-level spacing for even gaps
         if self.PH_CONTENT in placeholders:
-            placeholders[self.PH_CONTENT].text = content.get("content", AOC_BODY)
+            from pptx.util import Pt
+            ph = placeholders[self.PH_CONTENT]
+            ph.text = content.get("content", AOC_BODY)
+            # Add consistent space between paragraphs (6pt after each)
+            for para in ph.text_frame.paragraphs:
+                para.space_after = Pt(6)
+                para.space_before = Pt(6)
+
+        # Clear unused subtitle placeholder (removes dashed box)
+        if self.PH_SUBTITLE in placeholders:
+            sp = placeholders[self.PH_SUBTITLE]._element
+            sp.getparent().remove(sp)
 
         # Brisbane River artwork
         image_path = content.get("image_path", AOC_IMAGE_PATH)

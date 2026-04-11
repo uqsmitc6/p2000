@@ -167,7 +167,9 @@ class TitleTableHandler(SlideHandler):
                         break
 
         if title_shape:
-            result["title"] = title_shape["text"]
+            # Join multi-line titles into one line to save vertical space
+            # (tables need all the room they can get)
+            result["title"] = " ".join(title_shape["text"].split())
 
         # Subtitle — first remaining body shape if short
         if body_shapes and title_shape:

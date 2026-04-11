@@ -149,7 +149,35 @@ class Cover1Handler(SlideHandler):
                 parts.append(result["date_info"])
             result["subtitle"] = "\n".join(parts)
 
+        # If title is very long, try to split at a natural break point
+        # (colon, dash, em-dash) so the first part stays in the big title
+        # and the rest becomes the first line of the subtitle.
+        if result["title"]:
+            title_lines = self._estimate_title_lines(result["title"])
+            if title_lines > self.MAX_TITLE_LINES:
+                m = self.TITLE_SPLIT_PATTERN.match(result["title"])
+                if m:
+                    result["title"] = m.group(1).rstrip() + ":"
+                    overflow = m.group(2).strip()
+                    # Prepend overflow to subtitle
+                    if result["subtitle"]:
+                        result["subtitle"] = overflow + "\n" + result["subtitle"]
+                    else:
+                        result["subtitle"] = overflow
+
         return result
+
+    # --- Title splitting for long titles ---
+
+    # If a title would wrap to more than this many lines at 48pt, try to
+    # split it at a natural break point (colon, dash, em-dash) so the first
+    # part stays in the title placeholder and the rest becomes the first
+    # line of the subtitle placeholder (displayed at 18pt bold).
+    MAX_TITLE_LINES = 3
+
+    TITLE_SPLIT_PATTERN = re.compile(
+        r'^(.{15,}?)\s*[:–—-]\s*(.+)$', re.DOTALL
+    )
 
     # --- Title line estimation ---
 

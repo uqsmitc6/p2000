@@ -213,13 +213,25 @@ def extract_shapes_with_text(slide) -> list[dict]:
 def extract_images(slide) -> list[dict]:
     """
     Extract all images from a slide.
+
+    Checks three sources:
+        1. Picture shapes (shape_type 13) — the standard way
+        2. Placeholder shapes with an embedded image (e.g., content
+           placeholders where someone inserted a picture)
+        3. Shapes with image fill (background images in shapes)
+
     Returns list of dicts with: name, content_type, blob, left, top, width, height
     """
     images = []
+    seen_ids = set()  # Avoid duplicates
+
     for shape in slide.shapes:
-        if shape.shape_type == 13:  # Picture
+        image_data = None
+
+        # Method 1: Standard Picture shapes
+        if shape.shape_type == 13:
             try:
-                images.append({
+                image_data = {
                     "name": shape.name,
                     "content_type": shape.image.content_type,
                     "blob": shape.image.blob,
@@ -227,10 +239,9 @@ def extract_images(slide) -> list[dict]:
                     "top": shape.top,
                     "width": shape.width,
                     "height": shape.height,
-                })
-            except ValueError:
-                # Linked images (not embedded) — note presence but no blob
-                images.append({
+                }
+            except (ValueError, AttributeError):
+                image_data = {
                     "name": shape.name,
                     "content_type": None,
                     "blob": None,
@@ -238,5 +249,31 @@ def extract_images(slide) -> list[dict]:
                     "top": shape.top,
                     "width": shape.width,
                     "height": shape.height,
-                })
+                }
+
+        # Method 2: Placeholders or other shapes with .image property
+        elif hasattr(shape, 'image'):
+            try:
+                blob = shape.image.blob
+                if blob:
+                    image_data = {
+                        "name": shape.name,
+                        "content_type": shape.image.content_type,
+                        "blob": blob,
+                        "left": shape.left,
+                        "top": shape.top,
+                        "width": shape.width,
+                        "height": shape.height,
+                    }
+            except (ValueError, AttributeError):
+                pass
+
+        if image_data:
+            # Deduplicate by position + size
+            key = (image_data["left"], image_data["top"],
+                   image_data["width"], image_data["height"])
+            if key not in seen_ids:
+                seen_ids.add(key)
+                images.append(image_data)
+
     return images

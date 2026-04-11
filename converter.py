@@ -107,6 +107,25 @@ def convert_presentation(
         # AoC will be inserted after the cover slide is processed (see below)
     aoc_inserted = False
 
+    # --- Pre-scan for Thank You: only allow ONE closing slide ---
+    # Find the last slide that looks like a Thank You (heuristic or position)
+    # so we can reserve the Thank You layout for only that one.
+    last_thank_you_idx = None
+    ty_handler = handlers.get("Thank You")
+    if ty_handler:
+        for i in range(len(input_prs.slides) - 1, max(len(input_prs.slides) - 5, -1), -1):
+            if i in aoc_source_indices:
+                continue
+            s = input_prs.slides[i]
+            ty_score = ty_handler.detect(s, i)
+            if ty_score >= 0.5:
+                last_thank_you_idx = i
+                break
+        # If heuristics didn't find one, the last slide is the fallback
+        if last_thank_you_idx is None:
+            last_thank_you_idx = len(input_prs.slides) - 1
+    logger.info("Thank You reserved for source slide %d", (last_thank_you_idx or -1) + 1)
+
     for slide_idx, slide in enumerate(input_prs.slides):
 
         # Skip source AoC slides — we auto-insert a branded one
@@ -178,13 +197,27 @@ def convert_presentation(
                     continue
 
                 elif api_type in HANDLER_REGISTRY:
-                    # API classified it — use that handler
-                    best_name = api_type
-                    best_confidence = api_confidence
+                    # Guard: only allow Thank You for the reserved last slot
+                    if api_type == "Thank You" and slide_idx != last_thank_you_idx:
+                        logger.info("Slide %d: API suggested Thank You but reserved for slide %d — using Title and Content",
+                                    slide_idx + 1, (last_thank_you_idx or -1) + 1)
+                        best_name = "Title and Content"
+                        best_confidence = api_confidence
+                    else:
+                        # API classified it — use that handler
+                        best_name = api_type
+                        best_confidence = api_confidence
             elif api_result and api_result.get("error"):
                 err_msg = f"Slide {slide_idx + 1}: API error — {api_result['error']}"
                 logger.error(err_msg)
                 report["errors"].append(err_msg)
+
+        # --- Guard: Thank You only for the reserved last slot ---
+        if best_name == "Thank You" and slide_idx != last_thank_you_idx:
+            logger.info("Slide %d: downgrading Thank You to Title and Content (reserved for slide %d)",
+                        slide_idx + 1, (last_thank_you_idx or -1) + 1)
+            best_name = "Title and Content"
+            best_confidence = scores.get("Title and Content", 0.40)
 
         # --- Step 3: Convert or skip ---
         best_handler = handlers.get(best_name)
@@ -202,6 +235,9 @@ def convert_presentation(
 
                 new_slide = add_slide_from_layout(output_prs, layout_idx)
                 best_handler.fill_slide(new_slide, content)
+
+                # Remove unused subtitle placeholders (removes dashed boxes)
+                _cleanup_empty_subtitle(new_slide, best_handler, content)
 
                 # Populate footer and slide number on every converted slide
                 _fill_footer_and_slide_num(
@@ -404,6 +440,27 @@ def _detect_programme_name(prs) -> str:
                     best_text = shape.text_frame.text.strip()
 
     return best_text if len(best_text) < 120 else ""
+
+
+def _cleanup_empty_subtitle(slide, handler, content: dict):
+    """
+    Remove subtitle placeholder if the handler didn't populate it.
+    Prevents the dashed template prompt box from showing on output slides.
+    """
+    ph_map = handler.get_placeholder_map()
+    subtitle_idx = ph_map.get("subtitle")
+    if subtitle_idx is None:
+        return  # Handler has no subtitle placeholder
+
+    # Check if content actually provided a subtitle
+    if content and content.get("subtitle"):
+        return  # Subtitle was filled — keep it
+
+    # Remove the empty placeholder element from the slide XML
+    placeholders = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
+    if subtitle_idx in placeholders:
+        sp = placeholders[subtitle_idx]._element
+        sp.getparent().remove(sp)
 
 
 def _fill_footer_and_slide_num(slide, handler, programme_name: str, slide_number: int):
