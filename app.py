@@ -9,7 +9,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.5.4"
+APP_VERSION = "0.5.5"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -99,6 +99,39 @@ with st.expander("Supported slide types"):
 
 Slides that don't match a known type will be skipped and listed.
     """)
+
+with st.expander("System diagnostics"):
+    import subprocess
+    try:
+        lo_result = subprocess.run(
+            ["libreoffice", "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if lo_result.returncode == 0:
+            st.success(f"LibreOffice: {lo_result.stdout.strip()}")
+        else:
+            st.error(f"LibreOffice: error code {lo_result.returncode}")
+    except FileNotFoundError:
+        st.error("LibreOffice: NOT INSTALLED")
+    except Exception as e:
+        st.error(f"LibreOffice: {e}")
+
+    try:
+        ppm_result = subprocess.run(
+            ["pdftoppm", "-v"],
+            capture_output=True, text=True, timeout=5,
+        )
+        ppm_version = ppm_result.stderr.strip() or ppm_result.stdout.strip() or "available"
+        st.success(f"pdftoppm: {ppm_version}")
+    except FileNotFoundError:
+        st.error("pdftoppm (poppler-utils): NOT INSTALLED")
+    except Exception as e:
+        st.error(f"pdftoppm: {e}")
+
+    if api_key:
+        st.success("Anthropic API key: configured")
+    else:
+        st.warning("Anthropic API key: not set (heuristics only)")
 
 def _get_title(detail: dict) -> str:
     """Extract a display title from a report detail entry."""

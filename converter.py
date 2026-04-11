@@ -181,20 +181,28 @@ def convert_presentation(
                             api_result.get("reason", ""))
 
                 if api_type == "Skip":
-                    # API says skip this slide
-                    report["slides_skipped"] += 1
-                    report["details"].append({
-                        "slide": slide_idx + 1,
-                        "status": "skipped",
-                        "handler": None,
-                        "confidence": api_confidence,
-                        "content": None,
-                        "preview": _get_slide_preview(slide),
-                        "all_scores": scores,
-                        "classification_method": "api",
-                        "api_reason": api_result.get("reason", ""),
-                    })
-                    continue
+                    # API says skip — but if the heuristic found a viable
+                    # match above CONVERT_THRESHOLD, trust the heuristic.
+                    # This is especially important when slide rendering failed
+                    # (text-only fallback) and the slide has images but no text.
+                    if best_confidence >= CONVERT_THRESHOLD:
+                        logger.info("Slide %d: API said Skip but heuristic has %s at %.2f — keeping heuristic",
+                                    slide_idx + 1, best_name, best_confidence)
+                        # Don't skip — fall through to Step 3 with heuristic result
+                    else:
+                        report["slides_skipped"] += 1
+                        report["details"].append({
+                            "slide": slide_idx + 1,
+                            "status": "skipped",
+                            "handler": None,
+                            "confidence": api_confidence,
+                            "content": None,
+                            "preview": _get_slide_preview(slide),
+                            "all_scores": scores,
+                            "classification_method": "api",
+                            "api_reason": api_result.get("reason", ""),
+                        })
+                        continue
 
                 elif api_type in HANDLER_REGISTRY:
                     # Guard: only allow Thank You for the reserved last slot
@@ -348,8 +356,13 @@ def _render_slide_images(input_bytes: bytes) -> dict:
         Empty dict if rendering fails.
     """
     try:
-        from utils.renderer import render_slides_to_images
+        from utils.renderer import render_slides_to_images, is_libreoffice_available
+        if not is_libreoffice_available():
+            logger.error("LibreOffice not available — check Docker image has libreoffice-impress installed")
+            return {}
+        logger.info("LibreOffice available, starting render of %d bytes...", len(input_bytes))
         images = render_slides_to_images(input_bytes, dpi=150)
+        logger.info("Render complete: %d slide images produced", len(images))
         return {i: img for i, img in enumerate(images)}
     except Exception as e:
         logger.error("Slide rendering failed: %s", e, exc_info=True)
