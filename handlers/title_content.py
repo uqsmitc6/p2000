@@ -22,7 +22,7 @@ Design concerns (future):
 
 import re
 from handlers.base import SlideHandler
-from utils.extractor import extract_text_elements, extract_images, extract_shapes_with_text
+from utils.extractor import extract_text_elements, extract_images, extract_shapes_with_text, extract_rich_paragraphs
 
 
 class TitleContentHandler(SlideHandler):
@@ -104,6 +104,8 @@ class TitleContentHandler(SlideHandler):
         1. Use source placeholder indices if available — idx 0/3/15 = title,
            idx 1/10 = content body. This is the most reliable signal.
         2. Fall back to font size / position heuristics for non-placeholder shapes.
+        3. For the content body placeholder, extract rich paragraph data
+           (levels, runs, bold/italic) so formatting can be replayed on output.
         """
         shapes = extract_shapes_with_text(slide)
 
@@ -111,6 +113,7 @@ class TitleContentHandler(SlideHandler):
             "title": "",
             "subtitle": "",
             "content": "",
+            "rich_paragraphs": [],  # Rich paragraph data for formatted output
             "footer": "",
         }
 
@@ -138,6 +141,7 @@ class TitleContentHandler(SlideHandler):
         title_shape = None
         subtitle_shape = None
         body_shapes = []
+        body_placeholder = None  # The actual placeholder object for rich extraction
         footer_text = ""
 
         for s in filtered:
@@ -149,6 +153,13 @@ class TitleContentHandler(SlideHandler):
                 elif idx in (1, 10):
                     # BODY / CONTENT
                     body_shapes.append(s)
+                    # Find the actual placeholder object for rich extraction
+                    if body_placeholder is None:
+                        for shape in slide.shapes:
+                            if (hasattr(shape, 'is_placeholder') and shape.is_placeholder
+                                    and shape.placeholder_format.idx == idx):
+                                body_placeholder = shape
+                                break
                 elif idx in (17,):
                     # FOOTER
                     if not footer_text:
@@ -209,6 +220,50 @@ class TitleContentHandler(SlideHandler):
         if body_shapes:
             result["content"] = "\n".join(s["text"] for s in body_shapes)
 
+        # --- Rich paragraph extraction from the body placeholder ---
+        if body_placeholder:
+            raw_paras = extract_rich_paragraphs(body_placeholder)
+
+            # If a subtitle was detected, it came from the first paragraph(s)
+            # of the body placeholder. Remove those from rich_paragraphs to
+            # avoid duplicating text (subtitle goes in idx=31, body in idx=10).
+            if result["subtitle"] and raw_paras:
+                subtitle_text = result["subtitle"].strip()
+                # Skip leading paragraphs that match the subtitle text
+                while raw_paras and (
+                    raw_paras[0]["is_empty"]
+                    or raw_paras[0]["text"].strip() == subtitle_text
+                ):
+                    removed = raw_paras.pop(0)
+                    if removed["text"].strip() == subtitle_text:
+                        break  # Found and removed the subtitle para
+
+            result["rich_paragraphs"] = raw_paras
+
+        # --- Append non-placeholder body text (e.g. from group shapes) ---
+        # Group shapes and free text boxes contribute to 'content' but aren't
+        # in rich_paragraphs (which comes from the body placeholder only).
+        # Append them as additional bullet-level paragraphs.
+        if body_placeholder and body_shapes:
+            placeholder_text = body_placeholder.text_frame.text.strip()
+            for s in body_shapes:
+                # Skip the body placeholder itself (already in rich_paragraphs)
+                if s["is_placeholder"] and s["shape_idx"] in (1, 10):
+                    continue
+                shape_text = s["text"].strip()
+                if shape_text and shape_text not in placeholder_text:
+                    for line in shape_text.split("\n"):
+                        line = line.strip()
+                        if line:
+                            result["rich_paragraphs"].append({
+                                "level": 0,
+                                "runs": [{"text": line, "bold": False, "italic": None}],
+                                "text": line,
+                                "has_bullet": True,
+                                "bullet_char": "•",
+                                "is_empty": False,
+                            })
+
         return result
 
     def _is_image_caption(self, text: str) -> bool:
@@ -234,10 +289,22 @@ class TitleContentHandler(SlideHandler):
 
     # --- Output ---
 
+    # --- Template level mapping ---
+    # The UQ template master defines:
+    #   Level 0 (lvl1pPr): buNone, bold, accent1 colour — heading/label
+    #   Level 1 (lvl2pPr): buNone, regular, tx1 — sub-heading
+    #   Level 2 (lvl3pPr): buChar '•', regular, tx1 — bullet point
+    #   Level 3 (lvl4pPr): buChar '–', regular, tx1 — sub-bullet
+    #   Level 4 (lvl5pPr): buChar '–', regular, tx1 — sub-sub-bullet
+    TEMPLATE_HEADING_LEVEL = 0
+    TEMPLATE_BULLET_LEVEL = 2
+    TEMPLATE_SUBBULLET_LEVEL = 3
+
     def fill_slide(self, slide, content: dict) -> None:
         """
         Fill Title and Content placeholders.
         If no subtitle, shifts content body up to reclaim the space.
+        Uses rich paragraph data when available to preserve formatting.
         """
         from pptx.util import Emu
 
@@ -260,7 +327,6 @@ class TitleContentHandler(SlideHandler):
             ph = placeholders[self.PH_CONTENT]
 
             # Shift content up if no subtitle.
-            # IMPORTANT: preserve inherited left/width when modifying position.
             if not has_subtitle:
                 orig_left = ph.left
                 orig_width = ph.width
@@ -271,17 +337,182 @@ class TitleContentHandler(SlideHandler):
                 ph.width = orig_width
                 ph.height = new_height
 
-            ph.text = content["content"]
-
-            # Override the master's level-1 default which is bold + accent1.
-            # Body text should be regular weight.
-            for para in ph.text_frame.paragraphs:
-                for run in para.runs:
-                    run.font.bold = False
+            rich_paras = content.get("rich_paragraphs", [])
+            if rich_paras:
+                self._fill_rich_content(ph, rich_paras)
+            else:
+                # Fallback: plain text (for backwards compat)
+                ph.text = content["content"]
+                for para in ph.text_frame.paragraphs:
+                    for run in para.runs:
+                        run.font.bold = False
 
         # Footer
         if content.get("footer") and self.PH_FOOTER in placeholders:
             placeholders[self.PH_FOOTER].text = content["footer"]
+
+    def _fill_rich_content(self, placeholder, rich_paras: list[dict]) -> None:
+        """
+        Fill a content placeholder using rich paragraph data, preserving
+        bullet levels, bold/italic formatting, and paragraph structure.
+
+        Mapping strategy (source → template):
+        - Source level 0 with no bullet + short text → Template level 0 (heading)
+        - Source level 0 with bullet or long text → Template level 2 (bullet)
+        - Source level 1+ with bullet → Template level 2 or 3 (bullet/sub-bullet)
+        - Source level 2+ → Template level 3 (sub-bullet)
+        - Empty paragraphs → preserved as spacers (level 0, no bullet)
+        """
+        from pptx.oxml.ns import qn
+
+        tf = placeholder.text_frame
+
+        # Clear existing content — remove all but the first paragraph,
+        # then we'll overwrite the first and append the rest.
+        while len(tf.paragraphs) > 1:
+            p_elem = tf.paragraphs[-1]._p
+            p_elem.getparent().remove(p_elem)
+
+        # Filter out trailing empty paragraphs (source artefacts)
+        while rich_paras and rich_paras[-1]["is_empty"]:
+            rich_paras.pop()
+
+        for i, rp in enumerate(rich_paras):
+            if i == 0:
+                para = tf.paragraphs[0]
+                # Clear existing runs from the template paragraph
+                for r in list(para._p.findall(qn('a:r'))):
+                    para._p.remove(r)
+                # Also remove any existing a:br elements
+                for br in list(para._p.findall(qn('a:br'))):
+                    para._p.remove(br)
+            else:
+                para = self._add_paragraph(tf)
+
+            # Determine the target template level
+            target_level = self._map_source_level(rp)
+
+            # Set paragraph level
+            para.level = target_level
+
+            if rp["is_empty"]:
+                # Spacer paragraph — keep empty at level 0
+                para.level = 0
+                # Ensure no bullet on empty lines
+                self._set_no_bullet(para)
+                continue
+
+            # Populate runs
+            if rp["runs"]:
+                for run_data in rp["runs"]:
+                    run = para.add_run()
+                    run.text = run_data["text"]
+
+                    # Apply formatting — only set explicit overrides.
+                    # Level 0 in the template is bold by default (from master),
+                    # so we DON'T override bold for heading-level paragraphs.
+                    if target_level == self.TEMPLATE_HEADING_LEVEL:
+                        # Heading: let master bold apply. If source had
+                        # explicit bold=False on a run, respect that.
+                        if run_data["bold"] is False:
+                            run.font.bold = False
+                        # Otherwise leave as None (inherit master bold)
+                    else:
+                        # Bullet/sub-bullet levels: master is not bold.
+                        # Preserve source bold where explicitly set.
+                        if run_data["bold"] is True:
+                            run.font.bold = True
+                        # bold=None or False → leave as inherited (not bold)
+
+                    if run_data["italic"] is True:
+                        run.font.italic = True
+            else:
+                # No runs but has text (e.g. from soft-breaks)
+                run = para.add_run()
+                run.text = rp["text"]
+                if target_level != self.TEMPLATE_HEADING_LEVEL:
+                    pass  # Inherit template defaults
+
+    def _map_source_level(self, rp: dict) -> int:
+        """
+        Map a source paragraph to the appropriate UQ template level.
+
+        The UQ template defines:
+            Level 0: Heading (bold, purple, no bullet)
+            Level 2: Bullet point (•)
+            Level 3: Sub-bullet (–)
+
+        Source signals:
+            - has_bullet=True → it's a bulleted item
+            - has_bullet=False (buNone) → no bullet (heading or plain text)
+            - has_bullet=None → inherited from layout (assume bulleted if level > 0)
+            - level > 0 → indented (sub-item)
+        """
+        src_level = rp["level"]
+        has_bullet = rp["has_bullet"]
+        text = rp["text"].strip()
+
+        if rp["is_empty"]:
+            return 0
+
+        # Explicit bullet in source → map to template bullet levels
+        if has_bullet is True:
+            if src_level == 0:
+                return self.TEMPLATE_BULLET_LEVEL
+            elif src_level == 1:
+                return self.TEMPLATE_BULLET_LEVEL
+            else:
+                return self.TEMPLATE_SUBBULLET_LEVEL
+
+        # Explicit no-bullet (buNone) in source
+        if has_bullet is False:
+            # Short text at level 0 → heading
+            if src_level == 0 and len(text) < 120:
+                return self.TEMPLATE_HEADING_LEVEL
+            # Longer text → still heading but could be content
+            return self.TEMPLATE_HEADING_LEVEL
+
+        # Inherited bullet (has_bullet is None)
+        if src_level == 0:
+            # Level 0 with inherited formatting — look at the first run's
+            # bold state to decide heading vs bullet.
+            # bold=None means inheriting from master, which in academic
+            # slides typically means the master has bold on level-0.
+            # bold=True is explicitly bold. Either indicates a heading.
+            # bold=False is explicitly not bold → likely a bullet item.
+            runs = rp.get("runs", [])
+            first_run_bold = runs[0].get("bold") if runs else None
+            if first_run_bold is None or first_run_bold is True:
+                # Inherits or explicitly bold → heading
+                return self.TEMPLATE_HEADING_LEVEL
+            return self.TEMPLATE_BULLET_LEVEL
+        elif src_level <= 2:
+            return self.TEMPLATE_BULLET_LEVEL
+        else:
+            return self.TEMPLATE_SUBBULLET_LEVEL
+
+    @staticmethod
+    def _add_paragraph(text_frame):
+        """Add a new paragraph to a text frame and return it."""
+        from pptx.oxml.ns import qn
+        from lxml import etree
+
+        new_p = etree.SubElement(text_frame._txBody, qn('a:p'))
+        # Return the last paragraph (the one we just added)
+        return text_frame.paragraphs[-1]
+
+    @staticmethod
+    def _set_no_bullet(para):
+        """Explicitly set buNone on a paragraph to suppress inherited bullets."""
+        from pptx.oxml.ns import qn
+        from lxml import etree
+
+        pPr = para._p.find(qn('a:pPr'))
+        if pPr is None:
+            pPr = etree.SubElement(para._p, qn('a:pPr'))
+            # Insert pPr as the first child
+            para._p.insert(0, pPr)
+        etree.SubElement(pPr, qn('a:buNone'))
 
     def get_placeholder_map(self) -> dict:
         return {

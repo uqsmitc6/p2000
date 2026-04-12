@@ -211,6 +211,18 @@ def classify_slide_with_api(
                 messages=[{"role": "user", "content": text_desc}],
             )
 
+        # Log cost
+        try:
+            from utils.cost_logger import log_api_call
+            log_api_call(
+                message=message,
+                purpose="classification",
+                slide_info=f"Slide {slide_index + 1}/{total_slides}",
+                model=model,
+            )
+        except Exception:
+            pass  # Cost logging is non-critical
+
         response_text = message.content[0].text.strip()
 
         # Strip markdown code fences if present
@@ -436,6 +448,18 @@ def verify_slide_pair(
                 ],
             }],
         )
+
+        # Log cost
+        try:
+            from utils.cost_logger import log_api_call
+            log_api_call(
+                message=message,
+                purpose="verification",
+                slide_info=f"Slide {slide_number}/{total_slides}",
+                model=model,
+            )
+        except Exception:
+            pass  # Cost logging is non-critical
 
         response_text = message.content[0].text.strip()
 

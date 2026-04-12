@@ -152,14 +152,38 @@ def extract_shapes_with_text(slide) -> list[dict]:
     all its paragraphs joined. This preserves the shape-level grouping
     that's needed to distinguish title shapes from body shapes.
 
+    Also recurses into Group shapes to find text in nested AutoShapes.
+
     Returns a list of dicts:
         shape_name, shape_idx (placeholder idx or None), text,
         font_size (of largest run), bold, left, top, width, height,
-        is_placeholder, placeholder_type
+        is_placeholder, placeholder_type, is_group_text
     """
     shapes = []
 
     for shape in slide.shapes:
+        # Recurse into group shapes
+        if shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+            group_texts = _extract_group_text(shape)
+            if group_texts:
+                # Merge all group child texts into one entry
+                merged_text = "\n".join(group_texts)
+                shapes.append({
+                    "shape_name": shape.name,
+                    "shape_idx": None,
+                    "text": merged_text,
+                    "font_size": None,
+                    "bold": False,
+                    "left": shape.left,
+                    "top": shape.top,
+                    "width": shape.width,
+                    "height": shape.height,
+                    "is_placeholder": False,
+                    "placeholder_type": None,
+                    "is_group_text": True,
+                })
+            continue
+
         if not shape.has_text_frame:
             continue
 
@@ -205,9 +229,102 @@ def extract_shapes_with_text(slide) -> list[dict]:
             "height": shape.height,
             "is_placeholder": is_ph,
             "placeholder_type": ph_type,
+            "is_group_text": False,
         })
 
     return shapes
+
+
+def _extract_group_text(group_shape) -> list[str]:
+    """
+    Recursively extract text from all child shapes within a Group shape.
+    Returns a list of non-empty text strings found.
+    """
+    texts = []
+    try:
+        for child in group_shape.shapes:
+            if child.shape_type == 6:  # Nested group
+                texts.extend(_extract_group_text(child))
+            elif child.has_text_frame:
+                text = child.text_frame.text.strip()
+                if text:
+                    texts.append(text)
+    except Exception:
+        pass  # Group iteration can fail on malformed shapes
+    return texts
+
+
+def extract_rich_paragraphs(placeholder) -> list[dict]:
+    """
+    Extract paragraph-level formatting from a placeholder's text frame.
+
+    Preserves the structural data that plain-text extraction loses:
+    paragraph indent level, per-run bold/italic flags, explicit bullet
+    characters, and empty separator paragraphs.
+
+    Args:
+        placeholder: a python-pptx placeholder shape with a text_frame
+
+    Returns:
+        List of dicts, one per paragraph:
+        {
+            "level": int,              # 0-based indent level
+            "runs": [                  # list of text runs
+                {
+                    "text": str,
+                    "bold": bool|None,     # True/False/None(inherited)
+                    "italic": bool|None,
+                }
+            ],
+            "text": str,               # full paragraph text (convenience)
+            "has_bullet": bool|None,   # True=explicit bullet, False=buNone, None=inherited
+            "bullet_char": str|None,   # e.g. '•', '–', or None
+            "is_empty": bool,          # True if paragraph is blank (spacer)
+        }
+    """
+    ns_a = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
+    paragraphs = []
+
+    for para in placeholder.text_frame.paragraphs:
+        level = para.level
+        text = para.text
+
+        # Determine bullet info from XML
+        has_bullet = None
+        bullet_char = None
+        pPr = para._pPr
+        if pPr is not None:
+            buNone = pPr.find(f'{ns_a}buNone')
+            buChar = pPr.find(f'{ns_a}buChar')
+            if buNone is not None:
+                has_bullet = False
+            elif buChar is not None:
+                has_bullet = True
+                bullet_char = buChar.get('char')
+
+        # Extract runs with formatting
+        runs = []
+        for run in para.runs:
+            runs.append({
+                "text": run.text,
+                "bold": run.font.bold,      # True, False, or None
+                "italic": run.font.italic,  # True, False, or None
+            })
+
+        # Handle soft-breaks (<a:br/>) — these appear as vertical tab in text
+        # but not in runs. If there are more text segments than runs, we still
+        # capture the full text via the "text" key.
+
+        paragraphs.append({
+            "level": level,
+            "runs": runs,
+            "text": text,
+            "has_bullet": has_bullet,
+            "bullet_char": bullet_char,
+            "is_empty": not text.strip(),
+        })
+
+    return paragraphs
 
 
 def extract_images(slide) -> list[dict]:

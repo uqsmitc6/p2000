@@ -350,6 +350,72 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
             )
 
 
+# --- Admin: API Cost Tracker (sidebar) ---
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### Admin")
+
+    try:
+        from utils.cost_logger import get_cost_summary, get_cost_log, clear_cost_log
+
+        summary = get_cost_summary()
+
+        if summary["total_calls"] > 0:
+            st.metric("Total API cost", f"${summary['total_cost_usd']:.4f}")
+            st.caption(
+                f"{summary['total_calls']} calls · "
+                f"{summary['total_input_tokens']:,} in / "
+                f"{summary['total_output_tokens']:,} out tokens"
+            )
+
+            # Breakdown by purpose
+            by_purpose = summary.get("by_purpose", {})
+            if by_purpose:
+                purpose_lines = []
+                for purpose, stats in sorted(by_purpose.items()):
+                    purpose_lines.append(
+                        f"- **{purpose.title()}**: {stats['calls']} calls — "
+                        f"${stats['cost_usd']:.4f}"
+                    )
+                with st.expander("Cost by purpose"):
+                    st.markdown("\n".join(purpose_lines))
+
+            # Breakdown by date
+            by_date = summary.get("by_date", {})
+            if by_date:
+                with st.expander("Cost by date"):
+                    for date_str in sorted(by_date.keys(), reverse=True):
+                        stats = by_date[date_str]
+                        st.markdown(
+                            f"- **{date_str}**: {stats['calls']} calls — "
+                            f"${stats['cost_usd']:.4f}"
+                        )
+
+            # Recent calls
+            log = get_cost_log()
+            if log:
+                with st.expander(f"Recent calls ({min(len(log), 20)} of {len(log)})"):
+                    for entry in log[:20]:
+                        ts = entry.get("timestamp", "")[:19].replace("T", " ")
+                        purpose = entry.get("purpose", "?")
+                        slide = entry.get("slide_info", "")
+                        cost = entry.get("total_cost_usd", 0)
+                        tokens = entry.get("total_tokens", 0)
+                        st.caption(
+                            f"{ts} · {purpose} · {slide} · "
+                            f"{tokens:,} tokens · ${cost:.4f}"
+                        )
+
+            if st.button("Clear cost log", type="secondary"):
+                clear_cost_log()
+                st.rerun()
+        else:
+            st.caption("No API calls logged yet.")
+
+    except Exception as e:
+        st.caption(f"Cost tracker unavailable: {e}")
+
+
 # --- Footer ---
 st.markdown("---")
 st.caption("UQ Business School — Learning Design Team")
