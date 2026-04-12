@@ -73,23 +73,63 @@ def _post_to_sheets(entry: dict):
     to GET (standard HTTP behaviour), which means doGet() runs instead
     of doPost() and the payload is lost.
 
-    Fix: use a custom redirect handler that re-POSTs to the redirect URL.
+    Strategy: try 'requests' library first (handles redirects properly
+    with allow_redirects=False + manual follow).  Fall back to urllib
+    with a custom redirect handler if requests is not installed.
     """
     if not SHEETS_WEBHOOK_URL:
+        logger.info("Sheets webhook: no URL configured, skipping")
         return
+
+    logger.info("Sheets webhook: queuing POST for %s (%s)",
+                entry.get("purpose", "?"), entry.get("slide_info", "?"))
 
     def _do_post():
         try:
+            data_str = json.dumps(entry)
+            data_bytes = data_str.encode("utf-8")
+
+            # --- Try requests library first (more reliable with redirects) ---
+            try:
+                import requests as req_lib
+
+                # Don't follow redirects automatically — handle manually
+                resp = req_lib.post(
+                    SHEETS_WEBHOOK_URL,
+                    json=entry,
+                    timeout=20,
+                    allow_redirects=False,
+                )
+                logger.info("Sheets webhook: initial response %d", resp.status_code)
+
+                # Follow redirect manually, keeping POST method
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    redirect_url = resp.headers.get("Location", "")
+                    logger.info("Sheets webhook: following redirect to %s",
+                                redirect_url[:80])
+                    resp2 = req_lib.post(
+                        redirect_url,
+                        json=entry,
+                        timeout=20,
+                    )
+                    logger.info("Sheets webhook: final response %d — %s",
+                                resp2.status_code, resp2.text[:200])
+                else:
+                    logger.info("Sheets webhook: response body — %s",
+                                resp.text[:200])
+                return
+
+            except ImportError:
+                logger.info("Sheets webhook: 'requests' not installed, using urllib")
+
+            # --- Fallback: urllib with custom redirect handler ---
             import urllib.request
             import urllib.error
 
-            data = json.dumps(entry).encode("utf-8")
-
-            # Custom opener that re-POSTs on redirect instead of
-            # converting to GET (which is urllib's default behaviour).
             class PostRedirectHandler(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    # Re-issue as POST with same body to the redirect URL
+                    logger.info("Sheets webhook (urllib): redirect %d → %s",
+                                code, newurl[:80])
                     new_req = urllib.request.Request(
                         newurl,
                         data=req.data,
@@ -101,16 +141,16 @@ def _post_to_sheets(entry: dict):
             opener = urllib.request.build_opener(PostRedirectHandler)
             req = urllib.request.Request(
                 SHEETS_WEBHOOK_URL,
-                data=data,
+                data=data_bytes,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            response = opener.open(req, timeout=15)
+            response = opener.open(req, timeout=20)
             body = response.read().decode("utf-8")
 
-            logger.debug("Sheets POST OK: %s", body[:200])
+            logger.info("Sheets webhook (urllib): OK — %s", body[:200])
         except Exception as e:
-            logger.warning("Sheets POST failed (non-blocking): %s", e)
+            logger.error("Sheets webhook FAILED: %s", e, exc_info=True)
 
     thread = threading.Thread(target=_do_post, daemon=True)
     thread.start()

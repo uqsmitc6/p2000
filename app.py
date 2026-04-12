@@ -11,7 +11,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.8.31"
+APP_VERSION = "0.9.3"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -265,13 +265,113 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
         v_issues_count = v_summary.get("issues_found", 0)
         cols[col_idx].metric("QA issues", v_issues_count)
 
-    # --- Download ---
-    st.download_button(
-        label=f"Download {output_filename}",
-        data=output_bytes,
-        file_name=output_filename,
-        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    )
+    # --- Download buttons ---
+    dl_col1, dl_col2 = st.columns([1, 1])
+    with dl_col1:
+        st.download_button(
+            label=f"Download {output_filename}",
+            data=output_bytes,
+            file_name=output_filename,
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+    with dl_col2:
+        # Generate feedback report as markdown
+        feedback_lines = []
+        feedback_lines.append(f"# UQ Slide Converter — Feedback Report")
+        feedback_lines.append(f"")
+        source_name = output_filename.replace("_BRANDED.pptx", ".pptx")
+        feedback_lines.append(f"**Source file:** {source_name}")
+        feedback_lines.append(f"**Converted:** {converted} slides | **Flagged:** {flagged} | **Skipped:** {skipped}")
+        if api_calls:
+            feedback_lines.append(f"**AI calls:** {api_calls}")
+        if has_verification:
+            v_issues_count = v_summary.get("issues_found", 0)
+            v_passed_count = v_summary.get("passed", 0)
+            v_total = v_summary.get("total", 0)
+            feedback_lines.append(f"**Verification:** {v_passed_count} passed, {v_issues_count} issues ({v_total} slides checked)")
+        feedback_lines.append("")
+
+        # Slide-by-slide details
+        feedback_lines.append("---")
+        feedback_lines.append("")
+        feedback_lines.append("## Slide Details")
+        feedback_lines.append("")
+        for detail in report["details"]:
+            slide_num = detail["slide"]
+            handler = detail.get("handler", "?")
+            status = detail["status"]
+            title = _get_title(detail)
+            conf = detail.get("confidence", 0)
+            method = detail.get("classification_method", "heuristic")
+            method_tag = " (AI)" if method == "api" else " (heuristic)"
+
+            v = detail.get("verification", {})
+            if v.get("pass") is True:
+                v_status = "PASS"
+            elif v.get("pass") is False:
+                sev = v.get("severity", "unknown")
+                v_status = f"ISSUE ({sev})"
+            else:
+                v_status = "not verified"
+
+            feedback_lines.append(f"### Slide {slide_num} — {handler}: {title}")
+            feedback_lines.append(f"")
+            feedback_lines.append(f"- **Status:** {status} ({conf:.0%}{method_tag})")
+            feedback_lines.append(f"- **Verification:** {v_status}")
+
+            if v.get("pass") is False:
+                issues = v.get("issues", [])
+                for issue in issues:
+                    feedback_lines.append(f"  - {issue}")
+
+            feedback_lines.append("")
+
+        # Flagged slides section
+        flagged_items_fb = [d for d in report["details"] if d["status"] == "flagged"]
+        if flagged_items_fb:
+            feedback_lines.append("---")
+            feedback_lines.append("")
+            feedback_lines.append("## Flagged for Review")
+            feedback_lines.append("")
+            for d in flagged_items_fb:
+                title = _get_title(d)
+                conf = d.get("confidence", 0)
+                feedback_lines.append(f"- **Slide {d['slide']}** → {d.get('handler', '?')} ({conf:.0%}) — {title}")
+            feedback_lines.append("")
+
+        # Skipped slides section
+        skipped_items_fb = [d for d in report["details"] if d["status"] == "skipped"]
+        if skipped_items_fb:
+            feedback_lines.append("---")
+            feedback_lines.append("")
+            feedback_lines.append("## Skipped Slides (not in output)")
+            feedback_lines.append("")
+            for d in skipped_items_fb:
+                preview = d.get("preview", "(no text)")
+                reason = d.get("api_reason", d.get("reason", ""))
+                reason_str = f" — {reason}" if reason else ""
+                feedback_lines.append(f"- **Slide {d['slide']}**: {preview}{reason_str}")
+            feedback_lines.append("")
+
+        # Errors section
+        errors_fb = report.get("errors", [])
+        if errors_fb:
+            feedback_lines.append("---")
+            feedback_lines.append("")
+            feedback_lines.append("## Errors")
+            feedback_lines.append("")
+            for err in errors_fb:
+                feedback_lines.append(f"- {err}")
+            feedback_lines.append("")
+
+        feedback_md = "\n".join(feedback_lines)
+        feedback_filename = output_filename.replace("_BRANDED.pptx", "_FEEDBACK.md")
+        st.download_button(
+            label=f"Download feedback report",
+            data=feedback_md,
+            file_name=feedback_filename,
+            mime="text/markdown",
+        )
 
     # --- In-browser slide comparison viewer ---
     source_images = report.get("source_images", {})
