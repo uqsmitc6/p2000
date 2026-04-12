@@ -280,7 +280,7 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
     if source_images and output_images:
         st.markdown("---")
         st.markdown("### Slide Comparison Viewer")
-        st.caption("Side-by-side comparison of original → branded slides with AI verification feedback.")
+        st.caption("Side-by-side comparison of original → branded slides. Click any slide to expand.")
 
         # Build list of viewable slides (converted/flagged with both source and output images)
         viewable_slides = []
@@ -301,11 +301,41 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
                 "ok": "✅", "minor": "🟡", "major": "🟠", "critical": "🔴",
             }
 
-            # Build labels for slide selector
-            def _slide_label(d):
-                handler = d.get("handler", "?")
-                title = _get_title(d)[:35]
-                v = d.get("verification", {})
+            # --- Filter controls ---
+            filter_col1, filter_col2 = st.columns([1, 3])
+            with filter_col1:
+                show_filter = st.selectbox(
+                    "Show",
+                    ["All slides", "Issues only", "Passed only"],
+                    index=0,
+                    key="viewer_filter",
+                )
+
+            # Apply filter
+            if show_filter == "Issues only":
+                filtered_slides = [
+                    d for d in viewable_slides
+                    if d.get("verification", {}).get("pass") is False
+                ]
+            elif show_filter == "Passed only":
+                filtered_slides = [
+                    d for d in viewable_slides
+                    if d.get("verification", {}).get("pass") is True
+                ]
+            else:
+                filtered_slides = viewable_slides
+
+            st.caption(f"Showing {len(filtered_slides)} of {len(viewable_slides)} slides")
+
+            # --- All slides as expandable sections ---
+            for i, detail in enumerate(filtered_slides):
+                source_idx = detail["slide"] - 1
+                output_idx = detail.get("output_index")
+                handler = detail.get("handler", "?")
+                title = _get_title(detail)[:45]
+                v = detail.get("verification", {})
+
+                # Build expander label with status icon
                 if v.get("pass") is True:
                     icon = "✅"
                 elif v.get("pass") is False:
@@ -313,71 +343,33 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
                     icon = severity_icon.get(sev, "❓")
                 else:
                     icon = "—"
-                return f"{icon} Slide {d['slide']} → {handler}: {title}"
 
-            slide_labels = [_slide_label(d) for d in viewable_slides]
+                label = f"{icon} Slide {detail['slide']} → {handler}: {title}"
 
-            # Initialise viewer index from session state (set by nav buttons)
-            if "viewer_idx" not in st.session_state:
-                st.session_state["viewer_idx"] = 0
-            # Clamp to valid range (in case slide count changed)
-            viewer_default = min(
-                st.session_state["viewer_idx"], len(viewable_slides) - 1
-            )
+                # Auto-expand slides with issues
+                has_issues = v.get("pass") is False
+                with st.expander(label, expanded=has_issues):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**Original**")
+                        st.image(source_images[source_idx], use_container_width=True)
+                    with col2:
+                        st.markdown("**Branded**")
+                        st.image(output_images[output_idx], use_container_width=True)
 
-            selected_idx = st.selectbox(
-                "Select slide to compare",
-                range(len(slide_labels)),
-                index=viewer_default,
-                format_func=lambda i: slide_labels[i],
-                key="slide_selector",
-            )
-
-            # Keep session state in sync with selectbox choice
-            st.session_state["viewer_idx"] = selected_idx
-
-            detail = viewable_slides[selected_idx]
-            source_idx = detail["slide"] - 1
-            output_idx = detail.get("output_index")
-
-            # --- Side-by-side images ---
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Original**")
-                st.image(source_images[source_idx], use_container_width=True)
-            with col2:
-                st.markdown("**Branded**")
-                st.image(output_images[output_idx], use_container_width=True)
-
-            # --- Verification result ---
-            v = detail.get("verification", {})
-            if v:
-                if v.get("pass") is True:
-                    st.success("✅ Verification passed — no issues found")
-                elif v.get("pass") is False:
-                    sev = v.get("severity", "unknown")
-                    icon = severity_icon.get(sev, "❓")
-                    issues = v.get("issues", [])
-                    st.error(f"{icon} **{sev.title()}** — {len(issues)} issue(s) found")
-                    for issue in issues:
-                        st.markdown(f"- {issue}")
-                else:
-                    st.warning("Verification could not run for this slide")
-            else:
-                st.info("No verification data (AI verification not enabled)")
-
-            # --- Navigation buttons ---
-            nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
-            with nav_col1:
-                if selected_idx > 0:
-                    if st.button("← Previous"):
-                        st.session_state["viewer_idx"] = selected_idx - 1
-                        st.rerun()
-            with nav_col3:
-                if selected_idx < len(viewable_slides) - 1:
-                    if st.button("Next →"):
-                        st.session_state["viewer_idx"] = selected_idx + 1
-                        st.rerun()
+                    # Verification feedback
+                    if v:
+                        if v.get("pass") is True:
+                            st.success("Verification passed — no issues found")
+                        elif v.get("pass") is False:
+                            sev = v.get("severity", "unknown")
+                            sev_icon = severity_icon.get(sev, "❓")
+                            issues = v.get("issues", [])
+                            st.error(f"{sev_icon} **{sev.title()}** — {len(issues)} issue(s)")
+                            for issue in issues:
+                                st.markdown(f"- {issue}")
+                    else:
+                        st.info("No verification data (AI verification not enabled)")
 
     # --- Summary expanders (below viewer) ---
     st.markdown("---")

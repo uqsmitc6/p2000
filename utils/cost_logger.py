@@ -67,6 +67,13 @@ def _post_to_sheets(entry: dict):
     """
     POST a cost entry to Google Sheets via Apps Script webhook.
     Runs in a background thread so it never blocks the conversion.
+
+    Google Apps Script deployed web apps always respond with a 302
+    redirect.  Python's urllib follows the redirect but converts POST
+    to GET (standard HTTP behaviour), which means doGet() runs instead
+    of doPost() and the payload is lost.
+
+    Fix: use a custom redirect handler that re-POSTs to the redirect URL.
     """
     if not SHEETS_WEBHOOK_URL:
         return
@@ -77,27 +84,31 @@ def _post_to_sheets(entry: dict):
             import urllib.error
 
             data = json.dumps(entry).encode("utf-8")
+
+            # Custom opener that re-POSTs on redirect instead of
+            # converting to GET (which is urllib's default behaviour).
+            class PostRedirectHandler(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    # Re-issue as POST with same body to the redirect URL
+                    new_req = urllib.request.Request(
+                        newurl,
+                        data=req.data,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    return new_req
+
+            opener = urllib.request.build_opener(PostRedirectHandler)
             req = urllib.request.Request(
                 SHEETS_WEBHOOK_URL,
                 data=data,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            # Apps Script redirects on POST — follow it
-            response = urllib.request.urlopen(req, timeout=10)
+            response = opener.open(req, timeout=15)
             body = response.read().decode("utf-8")
 
-            # Apps Script returns 302 redirect; urllib follows it automatically
-            # for GET but not POST. Handle the redirect manually.
-            if response.status == 302:
-                redirect_url = response.getheader("Location")
-                if redirect_url:
-                    req2 = urllib.request.Request(redirect_url, data=data,
-                                                  headers={"Content-Type": "application/json"},
-                                                  method="POST")
-                    urllib.request.urlopen(req2, timeout=10)
-
-            logger.debug("Sheets POST OK: %s", body[:100])
+            logger.debug("Sheets POST OK: %s", body[:200])
         except Exception as e:
             logger.warning("Sheets POST failed (non-blocking): %s", e)
 
@@ -123,8 +134,6 @@ def _fetch_from_sheets() -> list[dict]:
 
         req = urllib.request.Request(SHEETS_WEBHOOK_URL, method="GET")
         response = urllib.request.urlopen(req, timeout=15)
-
-        # Apps Script may redirect GET requests too
         body = response.read().decode("utf-8")
         entries = json.loads(body)
 

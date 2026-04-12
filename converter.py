@@ -78,26 +78,49 @@ def convert_presentation(
     }
 
     # --- Pre-render slides to images if API key provided ---
+    # Memory guard: skip rendering for very large files (> 8 MB) to avoid
+    # exceeding Render free-tier memory limits (512 MB). Heuristic-only
+    # conversion still works — just no AI classification or verification.
+    MAX_RENDER_BYTES = 8 * 1024 * 1024  # 8 MB
     slide_images = {}
+    rendering_skipped_for_memory = False
+
     if api_key:
-        if progress_callback:
-            progress_callback("Rendering slides to images for AI classification...")
-        slide_images, render_diag = _render_slide_images(input_bytes)
-        if slide_images:
-            logger.info("Rendered %d slide images for Vision classification", len(slide_images))
+        if len(input_bytes) > MAX_RENDER_BYTES:
+            logger.warning(
+                "Input file too large for rendering (%d MB) — skipping AI "
+                "classification/verification to conserve memory",
+                len(input_bytes) // (1024 * 1024),
+            )
+            report["errors"].append(
+                f"File too large ({len(input_bytes) // (1024*1024)} MB) for AI-assisted "
+                f"classification and verification. Using heuristic-only mode to conserve memory. "
+                f"Conversion still works — check results manually."
+            )
+            rendering_skipped_for_memory = True
             if progress_callback:
                 progress_callback(
-                    f"Rendered {len(slide_images)} slide images. Classifying..."
+                    f"Large file ({len(input_bytes) // (1024*1024)} MB) — using heuristic-only mode."
                 )
         else:
-            logger.warning("Slide rendering failed — falling back to text-only classification")
-            report["errors"].append(
-                f"Slide rendering failed: {render_diag}. Used text-only classification fallback."
-            )
             if progress_callback:
-                progress_callback(
-                    "Could not render slide images. Using text-only fallback."
+                progress_callback("Rendering slides to images for AI classification...")
+            slide_images, render_diag = _render_slide_images(input_bytes)
+            if slide_images:
+                logger.info("Rendered %d slide images for Vision classification", len(slide_images))
+                if progress_callback:
+                    progress_callback(
+                        f"Rendered {len(slide_images)} slide images. Classifying..."
+                    )
+            else:
+                logger.warning("Slide rendering failed — falling back to text-only classification")
+                report["errors"].append(
+                    f"Slide rendering failed: {render_diag}. Used text-only classification fallback."
                 )
+                if progress_callback:
+                    progress_callback(
+                        "Could not render slide images. Using text-only fallback."
+                    )
 
     output_prs = open_template()
     new_slides_added = 0
@@ -769,6 +792,9 @@ def _cleanup_empty_placeholders(slide, handler, content: dict):
             continue
         if ph_idx is None:
             continue
+        # Skip non-integer values (e.g. lists of tuples for grid handlers)
+        if not isinstance(ph_idx, int):
+            continue
         # If the content has a value for this key, keep the placeholder
         if content and content.get(key):
             continue
@@ -806,12 +832,33 @@ def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
 
     # Handlers that extract body text into placeholders — only preserve
     # images, NOT group shapes (group text is already in rich_paragraphs
-    # and the visual group would overlap with the template's content area)
+    # and the visual group would overlap with the template's content area).
+    # EXCEPTION: if the slide has very little non-group text, the "body
+    # text" was likely extracted FROM the group shape and the diagram is
+    # the primary content. In that case, preserve group shapes.
     TEXT_HANDLERS = {
         "Title and Content", "Two Content", "Split Content",
         "References", "Quote",
     }
     skip_groups = handler_name in TEXT_HANDLERS
+
+    # Check if the slide is primarily a diagram (group shapes hold the
+    # main content). If so, don't skip groups even for TEXT_HANDLERS.
+    if skip_groups:
+        non_group_text_len = 0
+        has_groups = False
+        for shape in source_slide.shapes:
+            if hasattr(shape, 'is_placeholder') and shape.is_placeholder:
+                continue
+            if shape.shape_type == 6:  # Group
+                has_groups = True
+            elif shape.has_text_frame:
+                non_group_text_len += len(shape.text_frame.text.strip())
+        # If there are group shapes but very little non-group text,
+        # the diagram IS the content — preserve it
+        if has_groups and non_group_text_len < 100:
+            skip_groups = False
+            logger.info("  Preserving group shapes (diagram-dominant slide)")
 
     SLIDE_W = 12192000  # EMU
     SLIDE_H = 6858000
