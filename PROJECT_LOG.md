@@ -21,9 +21,34 @@
 - First deploy required manual container config fix via Azure CLI (`az webapp config container set`) — portal Deployment Center didn't propagate ACR credentials correctly on initial setup
 - Subsequent deploys are automatic via GitHub Actions on push to `main`
 
-**Files added:**
+**Feedback Report Download**
+- Added "Download feedback report" button alongside the PPTX download
+- Generates a Markdown (.md) file with full slide-by-slide details: handler, confidence, classification method, verification status, and all flagged issues
+- Filename pattern: `*_FEEDBACK.md`
+
+**Google Sheets Webhook — Further Fix**
+- Previous `urllib` redirect handler still not working on Render or Azure
+- Upgraded to use `requests` library (added to `requirements.txt`) with manual redirect following (`allow_redirects=False` + re-POST to redirect URL)
+- Added comprehensive `INFO`-level logging throughout the webhook flow — check Azure Log stream after a conversion to see exactly where it fails/succeeds
+- Falls back to `urllib` approach if `requests` is not installed
+
+**App Version**
+- Bumped `APP_VERSION` to 0.9.3
+
+**Files added/modified:**
 - `.github/workflows/deploy-azure.yml` — GitHub Actions CI/CD workflow
 - `deploy-azure.sh` — CLI-based deployment script (alternative to portal+Actions approach)
+- `app.py` — feedback download button, version bump
+- `utils/cost_logger.py` — webhook rewrite with `requests` + better logging
+- `requirements.txt` — added `requests>=2.31.0`
+- `PROJECT_LOG.md` — recreated (was lost during repo copy-over)
+
+**Pending / Known Issues:**
+- Google Sheets webhook: improved logging deployed but not yet confirmed working — check Azure Log stream after next conversion
+- ToC only generates with 3+ Section Divider slides (by design) — most NFS decks don't have these
+- References slide only generates with 2+ collected references (by design)
+- 8MB memory guard still active — can be raised/removed now that Azure B1 has 1.75GB RAM
+- Slide 5 (phantom bullet points behind purple box), Slide 12 (missing pie image), Slide 25 (title/text overlap) — need source file investigation to fix underlying handler logic
 
 ---
 

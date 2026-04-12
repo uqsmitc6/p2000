@@ -2,12 +2,14 @@
 API cost tracking for UQ Slide Converter.
 
 Logs every Anthropic API call with token counts and estimated cost.
-Dual storage:
-  1. Local JSONL file (ephemeral on Render, good for same-session reads)
-  2. Google Sheets via Apps Script webhook (persistent, survives redeploys)
 
-The Google Sheets backend is optional — set GOOGLE_SHEETS_WEBHOOK_URL in
-environment variables to enable it. If unset, only local logging is used.
+Storage: JSONL file on Azure's persistent /home volume. This survives
+container restarts and redeployments without any external services.
+
+The log directory can be overridden via COST_LOG_DIR env var, but
+defaults to /home/data/uq-slide-converter (Azure persistent storage).
+Falls back to /tmp/uq-slide-converter if /home is not writable
+(e.g. local dev without Docker).
 
 Usage:
     from utils.cost_logger import log_api_call, get_cost_summary
@@ -27,19 +29,47 @@ Usage:
 import json
 import logging
 import os
-import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger("uqslide.cost_logger")
 
-# --- Local JSONL storage (ephemeral on Render) ---
-COST_LOG_DIR = Path(os.environ.get("COST_LOG_DIR", "/tmp/uq-slide-converter"))
-COST_LOG_FILE = COST_LOG_DIR / "api_costs.jsonl"
+# --- Persistent JSONL storage ---
+# Azure App Service persists /home across restarts and redeploys.
+# Override with COST_LOG_DIR env var for local dev or other environments.
+_DEFAULT_DIR = "/home/data/uq-slide-converter"
+_FALLBACK_DIR = "/tmp/uq-slide-converter"
 
-# --- Google Sheets webhook (persistent) ---
-SHEETS_WEBHOOK_URL = os.environ.get("GOOGLE_SHEETS_WEBHOOK_URL", "")
+
+def _resolve_log_dir() -> Path:
+    """
+    Determine the best log directory, preferring persistent storage.
+
+    Priority:
+      1. COST_LOG_DIR env var (explicit override)
+      2. /home/data/uq-slide-converter (Azure persistent volume)
+      3. /tmp/uq-slide-converter (fallback for local dev)
+    """
+    explicit = os.environ.get("COST_LOG_DIR", "")
+    if explicit:
+        return Path(explicit)
+
+    home_dir = Path(_DEFAULT_DIR)
+    try:
+        home_dir.mkdir(parents=True, exist_ok=True)
+        # Test that we can actually write here
+        test_file = home_dir / ".write_test"
+        test_file.write_text("ok")
+        test_file.unlink()
+        logger.info("Cost log: using persistent storage at %s", home_dir)
+        return home_dir
+    except (OSError, PermissionError):
+        logger.warning("Cost log: /home not writable, falling back to %s", _FALLBACK_DIR)
+        return Path(_FALLBACK_DIR)
+
+
+COST_LOG_DIR = _resolve_log_dir()
+COST_LOG_FILE = COST_LOG_DIR / "api_costs.jsonl"
 
 # Pricing per million tokens (USD) — updated April 2026
 # https://docs.anthropic.com/en/docs/about-claude/pricing
@@ -53,146 +83,10 @@ MODEL_PRICING = {
 # Default fallback pricing if model not recognised
 DEFAULT_PRICING = {"input": 3.00, "output": 15.00}
 
-# Cache for Sheets data (avoids hammering the API on every admin panel load)
-_sheets_cache = {"data": None, "fetched_at": 0}
-SHEETS_CACHE_TTL = 60  # seconds
-
 
 def _ensure_log_dir():
     """Create log directory if needed."""
     COST_LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _post_to_sheets(entry: dict):
-    """
-    POST a cost entry to Google Sheets via Apps Script webhook.
-    Runs in a background thread so it never blocks the conversion.
-
-    Google Apps Script deployed web apps always respond with a 302
-    redirect.  Python's urllib follows the redirect but converts POST
-    to GET (standard HTTP behaviour), which means doGet() runs instead
-    of doPost() and the payload is lost.
-
-    Strategy: try 'requests' library first (handles redirects properly
-    with allow_redirects=False + manual follow).  Fall back to urllib
-    with a custom redirect handler if requests is not installed.
-    """
-    if not SHEETS_WEBHOOK_URL:
-        logger.info("Sheets webhook: no URL configured, skipping")
-        return
-
-    logger.info("Sheets webhook: queuing POST for %s (%s)",
-                entry.get("purpose", "?"), entry.get("slide_info", "?"))
-
-    def _do_post():
-        try:
-            data_str = json.dumps(entry)
-            data_bytes = data_str.encode("utf-8")
-
-            # --- Try requests library first (more reliable with redirects) ---
-            try:
-                import requests as req_lib
-
-                # Don't follow redirects automatically — handle manually
-                resp = req_lib.post(
-                    SHEETS_WEBHOOK_URL,
-                    json=entry,
-                    timeout=20,
-                    allow_redirects=False,
-                )
-                logger.info("Sheets webhook: initial response %d", resp.status_code)
-
-                # Follow redirect manually, keeping POST method
-                if resp.status_code in (301, 302, 303, 307, 308):
-                    redirect_url = resp.headers.get("Location", "")
-                    logger.info("Sheets webhook: following redirect to %s",
-                                redirect_url[:80])
-                    resp2 = req_lib.post(
-                        redirect_url,
-                        json=entry,
-                        timeout=20,
-                    )
-                    logger.info("Sheets webhook: final response %d — %s",
-                                resp2.status_code, resp2.text[:200])
-                else:
-                    logger.info("Sheets webhook: response body — %s",
-                                resp.text[:200])
-                return
-
-            except ImportError:
-                logger.info("Sheets webhook: 'requests' not installed, using urllib")
-
-            # --- Fallback: urllib with custom redirect handler ---
-            import urllib.request
-            import urllib.error
-
-            class PostRedirectHandler(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    logger.info("Sheets webhook (urllib): redirect %d → %s",
-                                code, newurl[:80])
-                    new_req = urllib.request.Request(
-                        newurl,
-                        data=req.data,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    return new_req
-
-            opener = urllib.request.build_opener(PostRedirectHandler)
-            req = urllib.request.Request(
-                SHEETS_WEBHOOK_URL,
-                data=data_bytes,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            response = opener.open(req, timeout=20)
-            body = response.read().decode("utf-8")
-
-            logger.info("Sheets webhook (urllib): OK — %s", body[:200])
-        except Exception as e:
-            logger.error("Sheets webhook FAILED: %s", e, exc_info=True)
-
-    thread = threading.Thread(target=_do_post, daemon=True)
-    thread.start()
-
-
-def _fetch_from_sheets() -> list[dict]:
-    """
-    GET all cost entries from Google Sheets. Returns list of dicts (newest first).
-    Uses a short TTL cache to avoid excessive requests.
-    """
-    if not SHEETS_WEBHOOK_URL:
-        return []
-
-    now = time.time()
-    if _sheets_cache["data"] is not None and (now - _sheets_cache["fetched_at"]) < SHEETS_CACHE_TTL:
-        return _sheets_cache["data"]
-
-    try:
-        import urllib.request
-        import urllib.error
-
-        req = urllib.request.Request(SHEETS_WEBHOOK_URL, method="GET")
-        response = urllib.request.urlopen(req, timeout=15)
-        body = response.read().decode("utf-8")
-        entries = json.loads(body)
-
-        if isinstance(entries, list):
-            entries.reverse()  # Newest first
-            _sheets_cache["data"] = entries
-            _sheets_cache["fetched_at"] = now
-            logger.debug("Fetched %d entries from Sheets", len(entries))
-            return entries
-        else:
-            logger.warning("Sheets GET returned non-list: %s", str(entries)[:100])
-            return []
-
-    except Exception as e:
-        logger.warning("Sheets GET failed: %s", e)
-        # Return stale cache if available
-        if _sheets_cache["data"] is not None:
-            return _sheets_cache["data"]
-        return []
 
 
 def log_api_call(
@@ -204,8 +98,6 @@ def log_api_call(
 ) -> dict:
     """
     Log an API call's token usage and estimated cost.
-
-    Writes to both local JSONL (immediate) and Google Sheets (background POST).
 
     Args:
         message: anthropic.types.Message object (has .usage attribute)
@@ -242,13 +134,10 @@ def log_api_call(
             "total_cost_usd": round(total_cost, 6),
         }
 
-        # 1. Local JSONL (immediate, ephemeral)
+        # Write to persistent JSONL
         _ensure_log_dir()
         with open(COST_LOG_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
-
-        # 2. Google Sheets (background, persistent)
-        _post_to_sheets(entry)
 
         logger.debug(
             "API cost: %s %s — %d in / %d out tokens — $%.4f",
@@ -265,18 +154,7 @@ def log_api_call(
 def get_cost_log() -> list[dict]:
     """
     Read all logged API calls. Returns list of dicts, newest first.
-
-    Strategy:
-    - If Google Sheets is configured, fetch from there (persistent, canonical)
-    - Fall back to local JSONL if Sheets is unavailable or unconfigured
     """
-    # Try Sheets first (persistent across deploys)
-    if SHEETS_WEBHOOK_URL:
-        sheets_entries = _fetch_from_sheets()
-        if sheets_entries:
-            return sheets_entries
-
-    # Fall back to local JSONL
     if not COST_LOG_FILE.exists():
         return []
 
@@ -307,6 +185,7 @@ def get_cost_summary(entries: list[dict] = None) -> dict:
             "by_purpose": {"classification": {...}, "verification": {...}},
             "by_model": {"claude-sonnet-4-6": {...}},
             "by_date": {"2026-04-12": {...}},
+            "by_filename": {"NFS_Session_1.pptx": {...}},
         }
     """
     if entries is None:
@@ -320,6 +199,7 @@ def get_cost_summary(entries: list[dict] = None) -> dict:
         "by_purpose": {},
         "by_model": {},
         "by_date": {},
+        "by_filename": {},
     }
 
     for e in entries:
@@ -356,6 +236,14 @@ def get_cost_summary(entries: list[dict] = None) -> dict:
         summary["by_date"][date_str]["tokens"] += inp + out
         summary["by_date"][date_str]["cost_usd"] += cost
 
+        # By filename
+        fname = e.get("filename", "") or "unknown"
+        if fname not in summary["by_filename"]:
+            summary["by_filename"][fname] = {"calls": 0, "tokens": 0, "cost_usd": 0.0}
+        summary["by_filename"][fname]["calls"] += 1
+        summary["by_filename"][fname]["tokens"] += inp + out
+        summary["by_filename"][fname]["cost_usd"] += cost
+
     summary["total_cost_usd"] = round(summary["total_cost_usd"], 4)
 
     return summary
@@ -365,4 +253,27 @@ def clear_cost_log():
     """Delete the local cost log file. Called from admin panel if needed."""
     if COST_LOG_FILE.exists():
         COST_LOG_FILE.unlink()
-        logger.info("Local cost log cleared")
+        logger.info("Cost log cleared: %s", COST_LOG_FILE)
+
+
+def export_cost_log_csv() -> str:
+    """
+    Export all cost entries as CSV string.
+    Useful for downloading from the admin panel.
+    """
+    entries = get_cost_log()
+    if not entries:
+        return ""
+
+    headers = [
+        "timestamp", "model", "purpose", "slide_info", "filename",
+        "input_tokens", "output_tokens", "total_tokens",
+        "input_cost_usd", "output_cost_usd", "total_cost_usd",
+    ]
+
+    lines = [",".join(headers)]
+    for e in reversed(entries):  # Chronological order for CSV
+        row = [str(e.get(h, "")) for h in headers]
+        lines.append(",".join(row))
+
+    return "\n".join(lines)

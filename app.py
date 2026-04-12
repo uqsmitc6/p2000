@@ -11,7 +11,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.9.4"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -588,7 +588,10 @@ with st.sidebar:
     st.markdown("### Admin")
 
     try:
-        from utils.cost_logger import get_cost_summary, get_cost_log, clear_cost_log
+        from utils.cost_logger import (
+            get_cost_summary, get_cost_log, clear_cost_log,
+            export_cost_log_csv, COST_LOG_FILE,
+        )
 
         summary = get_cost_summary()
 
@@ -599,6 +602,7 @@ with st.sidebar:
                 f"{summary['total_input_tokens']:,} in / "
                 f"{summary['total_output_tokens']:,} out tokens"
             )
+            st.caption(f"Log: `{COST_LOG_FILE}`")
 
             # Breakdown by purpose
             by_purpose = summary.get("by_purpose", {})
@@ -623,6 +627,17 @@ with st.sidebar:
                             f"${stats['cost_usd']:.4f}"
                         )
 
+            # Breakdown by filename
+            by_filename = summary.get("by_filename", {})
+            if by_filename:
+                with st.expander("Cost by file"):
+                    for fname in sorted(by_filename.keys()):
+                        stats = by_filename[fname]
+                        st.markdown(
+                            f"- **{fname}**: {stats['calls']} calls — "
+                            f"${stats['cost_usd']:.4f}"
+                        )
+
             # Recent calls
             log = get_cost_log()
             if log:
@@ -638,9 +653,22 @@ with st.sidebar:
                             f"{tokens:,} tokens · ${cost:.4f}"
                         )
 
-            if st.button("Clear cost log", type="secondary"):
-                clear_cost_log()
-                st.rerun()
+            # Export + Clear buttons
+            col_export, col_clear = st.columns(2)
+            with col_export:
+                csv_data = export_cost_log_csv()
+                if csv_data:
+                    st.download_button(
+                        "Export CSV",
+                        data=csv_data,
+                        file_name="api_costs.csv",
+                        mime="text/csv",
+                        type="secondary",
+                    )
+            with col_clear:
+                if st.button("Clear log", type="secondary"):
+                    clear_cost_log()
+                    st.rerun()
         else:
             st.caption("No API calls logged yet.")
 

@@ -136,10 +136,9 @@ echo "  2. Navigate to: App Services → ${APP_NAME} → Settings → Configurat
 echo "  3. Add these Application Settings:"
 echo ""
 echo "     ANTHROPIC_API_KEY = (your Anthropic API key)"
-echo "     GOOGLE_SHEETS_WEBHOOK_URL = (your Apps Script webhook URL)"
 echo ""
 echo "  Or set them via CLI:"
-echo "     az webapp config appsettings set --name ${APP_NAME} --resource-group ${RESOURCE_GROUP} --settings ANTHROPIC_API_KEY='sk-ant-...' GOOGLE_SHEETS_WEBHOOK_URL='https://script.google.com/...'"
+echo "     az webapp config appsettings set --name ${APP_NAME} --resource-group ${RESOURCE_GROUP} --settings ANTHROPIC_API_KEY='sk-ant-...'"
 echo ""
 
 # --- Step 7: Enable logging ---

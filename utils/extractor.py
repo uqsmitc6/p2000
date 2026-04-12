@@ -230,6 +230,7 @@ def extract_shapes_with_text(slide) -> list[dict]:
             "is_placeholder": is_ph,
             "placeholder_type": ph_type,
             "is_group_text": False,
+            "shape_ref": shape,  # actual shape object for rich extraction
         })
 
     return shapes
@@ -302,13 +303,31 @@ def extract_rich_paragraphs(placeholder) -> list[dict]:
                 has_bullet = True
                 bullet_char = buChar.get('char')
 
-        # Extract runs with formatting
+        # Extract runs with formatting (including hyperlinks)
         runs = []
         for run in para.runs:
+            # Check for hyperlink on this run
+            hyperlink_url = None
+            try:
+                r_elem = run._r
+                hlinkClick = r_elem.find(
+                    f'{ns_a}rPr/{ns_a}hlinkClick'
+                )
+                if hlinkClick is not None:
+                    r_ns = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+                    rId = hlinkClick.get(f'{r_ns}id')
+                    if rId:
+                        rel = placeholder.part.rels.get(rId)
+                        if rel:
+                            hyperlink_url = rel.target_ref
+            except (AttributeError, KeyError):
+                pass
+
             runs.append({
                 "text": run.text,
                 "bold": run.font.bold,      # True, False, or None
                 "italic": run.font.italic,  # True, False, or None
+                "hyperlink": hyperlink_url,  # URL string or None
             })
 
         # Handle soft-breaks (<a:br/>) — these appear as vertical tab in text

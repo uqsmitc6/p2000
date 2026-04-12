@@ -777,30 +777,78 @@ def _detect_programme_name(prs) -> str:
 def _cleanup_empty_placeholders(slide, handler, content: dict):
     """
     Remove unfilled placeholders so template prompt text doesn't show through.
-    Checks all keys in the handler's placeholder map (subtitle, entity, etc.)
-    and removes the XML element for any that weren't populated by content.
+
+    Strategy: iterate through ALL placeholders on the slide and remove any
+    that still contain only template prompt text (unfilled). This is safer
+    than matching against the content dict keys, because handler content
+    keys don't always match placeholder map keys (e.g. Split Content uses
+    "narrow_content"/"wide_content" but the map has "left"/"right").
+
     Skips title, footer, and slide_num (always handled separately).
+    Also skips placeholders that have real content (text, tables, images).
     """
+    # Placeholder indices to always keep
     ph_map = handler.get_placeholder_map()
-    placeholders = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
+    keep_indices = set()
+    for key in ("title", "footer", "slide_num"):
+        idx = ph_map.get(key)
+        if isinstance(idx, int):
+            keep_indices.add(idx)
 
-    # Keys that are always handled separately — don't remove
-    skip_keys = {"title", "footer", "slide_num"}
+    # Template prompt text patterns — these indicate unfilled placeholders
+    PROMPT_PATTERNS = [
+        "click to add", "click to edit", "click icon",
+        "[click", "[add", "[your", "[insert", "[subtitle",
+    ]
 
-    for key, ph_idx in ph_map.items():
-        if key in skip_keys:
+    for ph in list(slide.placeholders):
+        ph_idx = ph.placeholder_format.idx
+
+        # Always keep title, footer, slide number
+        if ph_idx in keep_indices:
             continue
-        if ph_idx is None:
-            continue
-        # Skip non-integer values (e.g. lists of tuples for grid handlers)
-        if not isinstance(ph_idx, int):
-            continue
-        # If the content has a value for this key, keep the placeholder
-        if content and content.get(key):
-            continue
-        # Remove the empty placeholder element from the slide XML
-        if ph_idx in placeholders:
-            sp = placeholders[ph_idx]._element
+
+        # Check if placeholder has real content
+        has_content = False
+
+        # Check for table (GraphicFrame with table)
+        try:
+            if ph.has_table:
+                has_content = True
+        except (AttributeError, TypeError):
+            pass
+
+        # Check for chart
+        try:
+            if ph.has_chart:
+                has_content = True
+        except (AttributeError, TypeError):
+            pass
+
+        # Check for text content
+        if not has_content:
+            try:
+                text = ph.text_frame.text.strip() if ph.has_text_frame else ""
+                if text:
+                    # Check if it's just template prompt text
+                    text_lower = text.lower()
+                    is_prompt = any(p in text_lower for p in PROMPT_PATTERNS)
+                    if not is_prompt:
+                        has_content = True
+            except (AttributeError, TypeError):
+                pass
+
+        # Check for image
+        if not has_content:
+            try:
+                if hasattr(ph, 'image') and ph.image:
+                    has_content = True
+            except (ValueError, AttributeError, TypeError):
+                pass
+
+        if not has_content:
+            # Remove the empty/prompt-only placeholder
+            sp = ph._element
             sp.getparent().remove(sp)
 
 
@@ -810,14 +858,18 @@ def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
     source slide to the output slide.  This preserves diagrams, charts,
     and images that the handler's text-based fill_slide can't reproduce.
 
+    Also recovers images from source placeholders when the output
+    placeholder was overwritten with text (e.g. a picture placeholder
+    in the source that becomes a text placeholder in the branded output).
+
     Skips:
     - Text placeholders (already handled by the handler)
-    - Very large background images (> 70% of slide in both dimensions)
+    - Very large background images (> 90% of slide in both dimensions)
     - Very small shapes (logos, icons < 8% of slide width)
     - TextImage handler slides (images are already placed via placeholder)
 
-    Uses XML deep-copy for group shapes and python-pptx add_picture
-    for image shapes (to correctly transfer image relationships).
+    Uses XML deep-copy for group shapes and SVG/EMF pictures.
+    Uses python-pptx add_picture for standard image shapes.
     """
     import io
     from copy import deepcopy
@@ -866,7 +918,7 @@ def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
     shapes_copied = 0
 
     for shape in source_slide.shapes:
-        # Skip placeholders — these are handled by the handler
+        # Skip placeholders — handled separately below
         if hasattr(shape, 'is_placeholder') and shape.is_placeholder:
             continue
 
@@ -878,8 +930,9 @@ def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
         w_pct = w / SLIDE_W if SLIDE_W else 0
         h_pct = h / SLIDE_H if SLIDE_H else 0
 
-        # Skip very large shapes (backgrounds, decorative fills)
-        if w_pct > 0.70 and h_pct > 0.50:
+        # Skip very large shapes (full-slide backgrounds/decorative fills)
+        # Raised from 70%/50% — 76%×71% content images were being filtered
+        if w_pct > 0.90 and h_pct > 0.85:
             continue
 
         # Skip very small shapes (logos, tiny icons)
@@ -898,37 +951,210 @@ def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
         elif shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
             try:
                 blob = shape.image.blob
-                content_type = shape.image.content_type
-                left = shape.left
-                top = shape.top
-                width = shape.width
-                height = shape.height
                 image_stream = io.BytesIO(blob)
                 output_slide.shapes.add_picture(
-                    image_stream, left, top, width, height
+                    image_stream, shape.left, shape.top,
+                    shape.width, shape.height
                 )
                 shapes_copied += 1
-            except Exception:
-                pass  # Skip images that can't be extracted
+            except Exception as e:
+                # Fallback for SVG/EMF images: python-pptx can't extract
+                # the blob when the main a:blip has no r:embed (SVG stores
+                # the ref in asvg:svgBlip extension). Use XML deep-copy.
+                logger.debug("  add_picture failed for '%s': %s — trying XML copy", shape.name, e)
+                try:
+                    _copy_picture_shape_xml(source_slide, output_slide, shape)
+                    shapes_copied += 1
+                except Exception as e2:
+                    logger.warning("  Could not preserve picture '%s': %s", shape.name, e2)
 
         # Shapes with image fill (e.g. rectangles with picture fills)
         elif hasattr(shape, 'image'):
             try:
                 blob = shape.image.blob
-                left = shape.left
-                top = shape.top
-                width = shape.width
-                height = shape.height
                 image_stream = io.BytesIO(blob)
                 output_slide.shapes.add_picture(
-                    image_stream, left, top, width, height
+                    image_stream, shape.left, shape.top,
+                    shape.width, shape.height
                 )
                 shapes_copied += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("  Could not preserve image-fill shape '%s': %s", shape.name, e)
+
+        # Visual shapes: freeforms, lines, auto shapes, connectors,
+        # SmartArt diagrams — XML deep copy to preserve diagram layouts.
+        # These are non-text visual elements that can't be reproduced
+        # from text extraction alone.
+        # Shape types: 1=AUTO_SHAPE, 5=FREEFORM, 9=LINE, None=SmartArt/diagram
+        elif shape_type in (1, 5, 9) or shape_type is None:
+            # For text handlers, only copy these if the slide is
+            # diagram-dominant (i.e. skip_groups is already False)
+            if skip_groups:
+                # But check: if the shape is purely visual (line, freeform
+                # with no/little text), always preserve it
+                shape_text = ""
+                try:
+                    if shape.has_text_frame:
+                        shape_text = shape.text_frame.text.strip()
+                except (AttributeError, TypeError):
+                    pass
+                # Lines and freeforms with no/minimal text are visual elements
+                if shape_type in (5, 9) and len(shape_text) < 10:
+                    pass  # Allow — these are visual diagram elements
+                elif shape_type is None:
+                    pass  # SmartArt — always preserve
+                else:
+                    continue  # Skip text-heavy auto shapes for text handlers
+            try:
+                _copy_shape_xml(source_slide, output_slide, shape)
+                shapes_copied += 1
+            except Exception as e:
+                logger.warning("  Could not preserve shape '%s' (type=%s): %s",
+                               shape.name, shape_type, e)
+
+    # --- Recover images from source placeholders ---
+    # When a source placeholder contains an image (e.g. a picture
+    # placeholder) but the handler overwrites it with text in the output,
+    # the image is lost. Detect and re-add these as free-standing pictures.
+    shapes_copied += _recover_placeholder_images(
+        source_slide, output_slide, handler_name
+    )
 
     if shapes_copied:
         logger.info("  Preserved %d visual shape(s) from source slide", shapes_copied)
+
+
+def _copy_shape_xml(source_slide, output_slide, shape):
+    """
+    Generic XML deep-copy for any shape (freeforms, lines, auto shapes,
+    SmartArt diagrams, etc.). Transfers all embedded relationships.
+    """
+    from copy import deepcopy
+
+    new_sp = deepcopy(shape._element)
+
+    src_part = source_slide.part
+    dst_part = output_slide.part
+
+    R_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+
+    for elem in new_sp.iter():
+        for attr_name in (f'{R_NS}embed', f'{R_NS}link', f'{R_NS}id'):
+            old_rId = elem.get(attr_name)
+            if old_rId:
+                try:
+                    rel = src_part.rels[old_rId]
+                    new_rId = dst_part.relate_to(rel.target_part, rel.reltype)
+                    elem.set(attr_name, new_rId)
+                except (KeyError, Exception):
+                    pass
+
+    output_slide.shapes._spTree.append(new_sp)
+
+
+def _copy_picture_shape_xml(source_slide, output_slide, pic_shape):
+    """
+    Deep-copy a picture shape via XML, transferring all relationships.
+    Used as fallback for SVG/EMF images where python-pptx .image.blob
+    fails (no r:embed on the main a:blip element).
+    """
+    from copy import deepcopy
+
+    new_sp = deepcopy(pic_shape._element)
+
+    src_part = source_slide.part
+    dst_part = output_slide.part
+
+    R_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+
+    for elem in new_sp.iter():
+        for attr_name in (f'{R_NS}embed', f'{R_NS}link'):
+            old_rId = elem.get(attr_name)
+            if old_rId:
+                try:
+                    rel = src_part.rels[old_rId]
+                    new_rId = dst_part.relate_to(rel.target_part, rel.reltype)
+                    elem.set(attr_name, new_rId)
+                except (KeyError, Exception) as e:
+                    logger.debug("  Skipped broken rel %s: %s", old_rId, e)
+
+    output_slide.shapes._spTree.append(new_sp)
+
+
+def _recover_placeholder_images(source_slide, output_slide, handler_name: str) -> int:
+    """
+    Check source placeholders for images that are missing from the output.
+
+    When the classifier picks a text-based layout for a slide whose source
+    had an image in a content placeholder, the handler fills that placeholder
+    with text and the image is lost. This function detects those cases and
+    copies the image as a free-standing picture on the output slide.
+
+    Returns the number of images recovered.
+    """
+    import io
+
+    # Only relevant for text-based handlers
+    TEXT_HANDLERS = {
+        "Title and Content", "Two Content", "Split Content",
+        "References", "Title Only",
+    }
+    if handler_name not in TEXT_HANDLERS:
+        return 0
+
+    recovered = 0
+
+    for src_ph in source_slide.placeholders:
+        idx = src_ph.placeholder_format.idx
+        # Skip title (0), subtitle (1), footer (17), slide number (18)
+        if idx in (0, 1, 17, 18):
+            continue
+
+        # Check if source placeholder has an image
+        src_has_image = False
+        try:
+            if hasattr(src_ph, 'image') and src_ph.image:
+                src_has_image = True
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+        if not src_has_image:
+            continue
+
+        # Check if the output placeholder for this idx has an image
+        out_has_image = False
+        for out_ph in output_slide.placeholders:
+            if out_ph.placeholder_format.idx == idx:
+                try:
+                    if hasattr(out_ph, 'image') and out_ph.image:
+                        out_has_image = True
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                break
+
+        if out_has_image:
+            continue
+
+        # Source had image, output doesn't — copy it
+        try:
+            blob = src_ph.image.blob
+            image_stream = io.BytesIO(blob)
+            output_slide.shapes.add_picture(
+                image_stream, src_ph.left, src_ph.top,
+                src_ph.width, src_ph.height
+            )
+            recovered += 1
+            logger.info("  Recovered placeholder image (ph=%d) from source", idx)
+        except Exception as e:
+            # SVG/EMF fallback
+            try:
+                _copy_picture_shape_xml(source_slide, output_slide, src_ph)
+                recovered += 1
+                logger.info("  Recovered placeholder image via XML (ph=%d)", idx)
+            except Exception as e2:
+                logger.warning("  Could not recover placeholder image (ph=%d): %s", idx, e2)
+
+    return recovered
 
 
 def _copy_group_shape(source_slide, output_slide, group_shape):

@@ -120,7 +120,8 @@ class TitleContentHandler(SlideHandler):
         if not shapes:
             return result
 
-        # Filter out noise, bare slide numbers, and image license text
+        # Filter out noise, bare slide numbers, image license text, and
+        # presenter annotations (e.g. "Stop recording in room")
         filtered = []
         for s in shapes:
             text = s["text"].strip()
@@ -131,6 +132,8 @@ class TitleContentHandler(SlideHandler):
             if re.match(r"^\d{1,3}$", text) and len(text) <= 3:
                 continue
             if self._is_image_caption(text):
+                continue
+            if self._is_presenter_annotation(s):
                 continue
             filtered.append(s)
 
@@ -243,7 +246,8 @@ class TitleContentHandler(SlideHandler):
         # --- Append non-placeholder body text (e.g. from group shapes) ---
         # Group shapes and free text boxes contribute to 'content' but aren't
         # in rich_paragraphs (which comes from the body placeholder only).
-        # Append them as additional bullet-level paragraphs.
+        # Append them as additional bullet-level paragraphs, preserving
+        # hyperlinks and formatting where possible.
         if body_placeholder and body_shapes:
             placeholder_text = body_placeholder.text_frame.text.strip()
             for s in body_shapes:
@@ -252,17 +256,27 @@ class TitleContentHandler(SlideHandler):
                     continue
                 shape_text = s["text"].strip()
                 if shape_text and shape_text not in placeholder_text:
-                    for line in shape_text.split("\n"):
-                        line = line.strip()
-                        if line:
-                            result["rich_paragraphs"].append({
-                                "level": 0,
-                                "runs": [{"text": line, "bold": False, "italic": None}],
-                                "text": line,
-                                "has_bullet": True,
-                                "bullet_char": "•",
-                                "is_empty": False,
-                            })
+                    # Try to extract rich paragraphs (with hyperlinks) from
+                    # the actual shape object if available
+                    shape_ref = s.get("shape_ref")
+                    if shape_ref and hasattr(shape_ref, 'text_frame'):
+                        shape_paras = extract_rich_paragraphs(shape_ref)
+                        for sp in shape_paras:
+                            if not sp["is_empty"]:
+                                result["rich_paragraphs"].append(sp)
+                    else:
+                        for line in shape_text.split("\n"):
+                            line = line.strip()
+                            if line:
+                                result["rich_paragraphs"].append({
+                                    "level": 0,
+                                    "runs": [{"text": line, "bold": False,
+                                              "italic": None, "hyperlink": None}],
+                                    "text": line,
+                                    "has_bullet": True,
+                                    "bullet_char": "•",
+                                    "is_empty": False,
+                                })
 
         return result
 
@@ -277,6 +291,37 @@ class TitleContentHandler(SlideHandler):
             r"(?i)source:\s*(http|www)",
         ]
         return any(re.search(p, text) for p in caption_patterns)
+
+    @staticmethod
+    def _is_presenter_annotation(shape_info: dict) -> bool:
+        """
+        Check if a non-placeholder shape contains a presenter/instructor
+        annotation rather than audience-facing content.
+
+        These are common in academic decks — reminders to the presenter
+        like "stop recording", "play video", "hand out materials", etc.
+        They're typically in AutoShapes or text boxes (not placeholders).
+        """
+        if shape_info.get("is_placeholder"):
+            return False  # Placeholder content is always real content
+
+        text = shape_info["text"].strip().lower()
+        annotation_patterns = [
+            r"(?i)^stop\s+recording",
+            r"(?i)^start\s+recording",
+            r"(?i)^play\s+video",
+            r"(?i)^show\s+video",
+            r"(?i)^pause\s+recording",
+            r"(?i)^hand\s+out\b",
+            r"(?i)^distribute\s+",
+            r"(?i)^presenter\s+note",
+            r"(?i)^facilitator\s+note",
+            r"(?i)^instructor\s+note",
+            r"(?i)^note\s+to\s+(self|presenter|facilitator)",
+            r"(?i)recording\s+in\s+room",
+            r"(?i)^break\s*[-–—:]\s*\d+\s*min",
+        ]
+        return any(re.search(p, text) for p in annotation_patterns)
 
     def _is_footer_text(self, text: str) -> bool:
         """Check if text looks like a footer/programme name."""
@@ -327,16 +372,32 @@ class TitleContentHandler(SlideHandler):
         if content.get("content") and self.PH_CONTENT in placeholders:
             ph = placeholders[self.PH_CONTENT]
 
-            # Shift content up if no subtitle.
+            # Shift content up if no subtitle — but only if the title is
+            # short enough to fit on one line. Long titles wrap within the
+            # 0.51" title placeholder and visually extend into the gap.
+            # At ~28pt Arial in the ~9.5" wide title placeholder, approx
+            # 40 chars fit on one line.
             if not has_subtitle:
-                orig_left = ph.left
-                orig_width = ph.width
-                new_top = ph.top - self.SUBTITLE_HEIGHT_EMU
-                new_height = ph.height + self.SUBTITLE_HEIGHT_EMU
-                ph.top = new_top
-                ph.left = orig_left
-                ph.width = orig_width
-                ph.height = new_height
+                title_len = len(content.get("title", ""))
+                if title_len <= 35:
+                    # Short title — safe to reclaim full subtitle space
+                    shift = self.SUBTITLE_HEIGHT_EMU
+                elif title_len <= 50:
+                    # Medium title — might wrap, shift less
+                    shift = self.SUBTITLE_HEIGHT_EMU // 2
+                else:
+                    # Long title — definitely wraps, don't shift
+                    shift = 0
+
+                if shift > 0:
+                    orig_left = ph.left
+                    orig_width = ph.width
+                    new_top = ph.top - shift
+                    new_height = ph.height + shift
+                    ph.top = new_top
+                    ph.left = orig_left
+                    ph.width = orig_width
+                    ph.height = new_height
 
             rich_paras = content.get("rich_paragraphs", [])
             if rich_paras:
@@ -427,6 +488,10 @@ class TitleContentHandler(SlideHandler):
 
                     if run_data["italic"] is True:
                         run.font.italic = True
+
+                    # Preserve hyperlinks
+                    if run_data.get("hyperlink"):
+                        run.hyperlink.address = run_data["hyperlink"]
             else:
                 # No runs but has text (e.g. from soft-breaks)
                 run = para.add_run()

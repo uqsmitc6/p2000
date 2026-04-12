@@ -7,5 +7,3 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: GOOGLE_SHEETS_WEBHOOK_URL
-        sync: false

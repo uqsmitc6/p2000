@@ -220,8 +220,9 @@ def classify_slide_with_api(
                 slide_info=f"Slide {slide_index + 1}/{total_slides}",
                 model=model,
             )
-        except Exception:
-            pass  # Cost logging is non-critical
+        except Exception as e:
+            logger.warning("Cost logging failed for classification slide %d: %s",
+                           slide_index + 1, e)
 
         response_text = message.content[0].text.strip()
 
@@ -458,8 +459,9 @@ def verify_slide_pair(
                 slide_info=f"Slide {slide_number}/{total_slides}",
                 model=model,
             )
-        except Exception:
-            pass  # Cost logging is non-critical
+        except Exception as e:
+            logger.warning("Cost logging failed for verification slide %d: %s",
+                           slide_number, e)
 
         response_text = message.content[0].text.strip()
 
