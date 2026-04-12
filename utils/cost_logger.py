@@ -2,7 +2,12 @@
 API cost tracking for UQ Slide Converter.
 
 Logs every Anthropic API call with token counts and estimated cost.
-Data is stored in a JSON Lines file that persists between sessions.
+Dual storage:
+  1. Local JSONL file (ephemeral on Render, good for same-session reads)
+  2. Google Sheets via Apps Script webhook (persistent, survives redeploys)
+
+The Google Sheets backend is optional — set GOOGLE_SHEETS_WEBHOOK_URL in
+environment variables to enable it. If unset, only local logging is used.
 
 Usage:
     from utils.cost_logger import log_api_call, get_cost_summary
@@ -22,15 +27,19 @@ Usage:
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger("uqslide.cost_logger")
 
-# Persistent log file — stored alongside the app
+# --- Local JSONL storage (ephemeral on Render) ---
 COST_LOG_DIR = Path(os.environ.get("COST_LOG_DIR", "/tmp/uq-slide-converter"))
 COST_LOG_FILE = COST_LOG_DIR / "api_costs.jsonl"
+
+# --- Google Sheets webhook (persistent) ---
+SHEETS_WEBHOOK_URL = os.environ.get("GOOGLE_SHEETS_WEBHOOK_URL", "")
 
 # Pricing per million tokens (USD) — updated April 2026
 # https://docs.anthropic.com/en/docs/about-claude/pricing
@@ -44,10 +53,97 @@ MODEL_PRICING = {
 # Default fallback pricing if model not recognised
 DEFAULT_PRICING = {"input": 3.00, "output": 15.00}
 
+# Cache for Sheets data (avoids hammering the API on every admin panel load)
+_sheets_cache = {"data": None, "fetched_at": 0}
+SHEETS_CACHE_TTL = 60  # seconds
+
 
 def _ensure_log_dir():
     """Create log directory if needed."""
     COST_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _post_to_sheets(entry: dict):
+    """
+    POST a cost entry to Google Sheets via Apps Script webhook.
+    Runs in a background thread so it never blocks the conversion.
+    """
+    if not SHEETS_WEBHOOK_URL:
+        return
+
+    def _do_post():
+        try:
+            import urllib.request
+            import urllib.error
+
+            data = json.dumps(entry).encode("utf-8")
+            req = urllib.request.Request(
+                SHEETS_WEBHOOK_URL,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            # Apps Script redirects on POST — follow it
+            response = urllib.request.urlopen(req, timeout=10)
+            body = response.read().decode("utf-8")
+
+            # Apps Script returns 302 redirect; urllib follows it automatically
+            # for GET but not POST. Handle the redirect manually.
+            if response.status == 302:
+                redirect_url = response.getheader("Location")
+                if redirect_url:
+                    req2 = urllib.request.Request(redirect_url, data=data,
+                                                  headers={"Content-Type": "application/json"},
+                                                  method="POST")
+                    urllib.request.urlopen(req2, timeout=10)
+
+            logger.debug("Sheets POST OK: %s", body[:100])
+        except Exception as e:
+            logger.warning("Sheets POST failed (non-blocking): %s", e)
+
+    thread = threading.Thread(target=_do_post, daemon=True)
+    thread.start()
+
+
+def _fetch_from_sheets() -> list[dict]:
+    """
+    GET all cost entries from Google Sheets. Returns list of dicts (newest first).
+    Uses a short TTL cache to avoid excessive requests.
+    """
+    if not SHEETS_WEBHOOK_URL:
+        return []
+
+    now = time.time()
+    if _sheets_cache["data"] is not None and (now - _sheets_cache["fetched_at"]) < SHEETS_CACHE_TTL:
+        return _sheets_cache["data"]
+
+    try:
+        import urllib.request
+        import urllib.error
+
+        req = urllib.request.Request(SHEETS_WEBHOOK_URL, method="GET")
+        response = urllib.request.urlopen(req, timeout=15)
+
+        # Apps Script may redirect GET requests too
+        body = response.read().decode("utf-8")
+        entries = json.loads(body)
+
+        if isinstance(entries, list):
+            entries.reverse()  # Newest first
+            _sheets_cache["data"] = entries
+            _sheets_cache["fetched_at"] = now
+            logger.debug("Fetched %d entries from Sheets", len(entries))
+            return entries
+        else:
+            logger.warning("Sheets GET returned non-list: %s", str(entries)[:100])
+            return []
+
+    except Exception as e:
+        logger.warning("Sheets GET failed: %s", e)
+        # Return stale cache if available
+        if _sheets_cache["data"] is not None:
+            return _sheets_cache["data"]
+        return []
 
 
 def log_api_call(
@@ -59,6 +155,8 @@ def log_api_call(
 ) -> dict:
     """
     Log an API call's token usage and estimated cost.
+
+    Writes to both local JSONL (immediate) and Google Sheets (background POST).
 
     Args:
         message: anthropic.types.Message object (has .usage attribute)
@@ -95,10 +193,13 @@ def log_api_call(
             "total_cost_usd": round(total_cost, 6),
         }
 
-        # Append to log file
+        # 1. Local JSONL (immediate, ephemeral)
         _ensure_log_dir()
         with open(COST_LOG_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
+
+        # 2. Google Sheets (background, persistent)
+        _post_to_sheets(entry)
 
         logger.debug(
             "API cost: %s %s — %d in / %d out tokens — $%.4f",
@@ -113,7 +214,20 @@ def log_api_call(
 
 
 def get_cost_log() -> list[dict]:
-    """Read all logged API calls. Returns list of dicts, newest first."""
+    """
+    Read all logged API calls. Returns list of dicts, newest first.
+
+    Strategy:
+    - If Google Sheets is configured, fetch from there (persistent, canonical)
+    - Fall back to local JSONL if Sheets is unavailable or unconfigured
+    """
+    # Try Sheets first (persistent across deploys)
+    if SHEETS_WEBHOOK_URL:
+        sheets_entries = _fetch_from_sheets()
+        if sheets_entries:
+            return sheets_entries
+
+    # Fall back to local JSONL
     if not COST_LOG_FILE.exists():
         return []
 
@@ -199,7 +313,7 @@ def get_cost_summary(entries: list[dict] = None) -> dict:
 
 
 def clear_cost_log():
-    """Delete the cost log file. Called from admin panel if needed."""
+    """Delete the local cost log file. Called from admin panel if needed."""
     if COST_LOG_FILE.exists():
         COST_LOG_FILE.unlink()
-        logger.info("Cost log cleared")
+        logger.info("Local cost log cleared")
