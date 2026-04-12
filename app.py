@@ -9,7 +9,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.5.6"
+APP_VERSION = "0.6.0"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -203,12 +203,19 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
     api_calls = report.get("api_calls", 0)
 
     # --- Summary ---
-    cols = st.columns(4 if api_calls else 3)
-    cols[0].metric("Converted", converted)
-    cols[1].metric("Flagged", flagged)
-    cols[2].metric("Skipped", skipped)
+    v_summary = report.get("verification_summary", {})
+    has_verification = bool(v_summary)
+    num_cols = 3 + (1 if api_calls else 0) + (1 if has_verification else 0)
+    cols = st.columns(num_cols)
+    col_idx = 0
+    cols[col_idx].metric("Converted", converted); col_idx += 1
+    cols[col_idx].metric("Flagged", flagged); col_idx += 1
+    cols[col_idx].metric("Skipped", skipped); col_idx += 1
     if api_calls:
-        cols[3].metric("AI calls", api_calls)
+        cols[col_idx].metric("AI calls", api_calls); col_idx += 1
+    if has_verification:
+        v_issues_count = v_summary.get("issues_found", 0)
+        cols[col_idx].metric("QA issues", v_issues_count)
 
     # --- Download ---
     st.download_button(
@@ -278,6 +285,52 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
                 else:
                     st.markdown(f"- {err}")
             logger.warning("Conversion completed with %d errors", len(errors))
+
+    # --- Verification Results ---
+    verification = report.get("verification", [])
+    v_summary = report.get("verification_summary", {})
+    if verification:
+        v_issues = [v for v in verification if v.get("pass") is False]
+        v_passed = [v for v in verification if v.get("pass") is True]
+
+        severity_icon = {"ok": "✅", "minor": "🟡", "major": "🟠", "critical": "🔴"}
+
+        if v_issues:
+            with st.expander(
+                f"🔍 Verification issues ({len(v_issues)} of {len(verification)} slides)",
+                expanded=True,
+            ):
+                st.info(
+                    "AI compared each original slide against its branded version "
+                    "and found the following issues."
+                )
+                for v in v_issues:
+                    sev = v.get("severity", "unknown")
+                    icon = severity_icon.get(sev, "❓")
+                    handler = v.get("handler", "")
+                    issues_text = "; ".join(v.get("issues", []))
+                    st.markdown(
+                        f"- {icon} **Slide {v['source_slide']}** → {handler} "
+                        f"({sev}) — {issues_text}"
+                    )
+
+        if v_passed:
+            with st.expander(
+                f"✅ Verification passed ({len(v_passed)} slides)", expanded=False
+            ):
+                for v in v_passed:
+                    handler = v.get("handler", "")
+                    st.markdown(
+                        f"- **Slide {v['source_slide']}** → {handler} — OK"
+                    )
+
+        if v_summary:
+            st.caption(
+                f"Verification: {v_summary.get('passed', 0)} passed, "
+                f"{v_summary.get('issues_found', 0)} issues, "
+                f"{v_summary.get('errors', 0)} errors "
+                f"({v_summary.get('total', 0)} slides checked)"
+            )
 
 
 # --- Footer ---

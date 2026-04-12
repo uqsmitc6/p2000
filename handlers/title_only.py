@@ -11,14 +11,15 @@ may have images, diagrams, or charts that fill the content area. These
 slides are distinguished from Section Dividers by not having the sparse,
 structured section-number + title pattern.
 
-Note: Images/charts cannot be transferred to the template automatically
-(they'd need to be re-embedded). This handler preserves the title and
-flags the slide as needing manual image re-insertion.
+Images are extracted from the source slide and placed as free-floating
+shapes in the content area below the title.
 
 CRITICAL RULE: Never set font properties on placeholders.
 """
 
+import io
 import re
+from pptx.util import Emu
 from handlers.base import SlideHandler
 from utils.extractor import extract_text_elements, extract_images, extract_shapes_with_text
 
@@ -111,9 +112,8 @@ class TitleOnlyHandler(SlideHandler):
 
     def extract_content(self, slide, slide_index: int) -> dict:
         """
-        Extract just the title. Body content is intentionally empty
-        since these slides typically have visual content that can't
-        be auto-transferred.
+        Extract the title and any images from the slide.
+        Images are stored as blobs with position/size info for placement.
         """
         shapes = extract_shapes_with_text(slide)
 
@@ -121,11 +121,19 @@ class TitleOnlyHandler(SlideHandler):
             "title": "",
             "footer": "",
             "has_images": False,
+            "images": [],  # list of {"blob": bytes, "width": emu, "height": emu}
         }
 
-        # Check for images
+        # Extract images with their data
         images = extract_images(slide)
         result["has_images"] = bool(images)
+        for img in images:
+            if img.get("blob"):
+                result["images"].append({
+                    "blob": img["blob"],
+                    "width": img.get("width"),
+                    "height": img.get("height"),
+                })
 
         if not shapes:
             return result
@@ -183,12 +191,88 @@ class TitleOnlyHandler(SlideHandler):
 
     # --- Output ---
 
+    # Content area dimensions (below title, above footer)
+    # Title bottom ~1.49in, footer top ~6.98in, left margin ~0.52in
+    CONTENT_TOP = Emu(1500000)      # ~1.64in — a little below title bottom
+    CONTENT_LEFT = Emu(479424)      # matches title left margin
+    CONTENT_WIDTH = Emu(11233151)   # slide width minus margins
+    CONTENT_HEIGHT = Emu(4800000)   # ~5.25in available height
+    FOOTER_TOP = Emu(6381750)       # footer starts here
+
     def fill_slide(self, slide, content: dict) -> None:
-        """Fill Title Only placeholder. NEVER set font properties."""
+        """
+        Fill Title Only placeholder and place extracted images.
+        NEVER set font properties.
+        """
         placeholders = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
 
         if content.get("title") and self.PH_TITLE in placeholders:
             placeholders[self.PH_TITLE].text = content["title"]
+
+        # Place extracted images in the content area
+        images = content.get("images", [])
+        if images:
+            self._place_images(slide, images)
+
+    def _place_images(self, slide, images: list) -> None:
+        """
+        Place extracted images in the content area below the title.
+
+        For a single image: centre it in the available space, scaling
+        to fit while maintaining aspect ratio.
+        For multiple images: arrange side by side if they fit, otherwise
+        just place the largest one.
+        """
+        if not images:
+            return
+
+        avail_w = self.CONTENT_WIDTH
+        avail_h = self.CONTENT_HEIGHT
+
+        if len(images) == 1:
+            self._place_single_image(slide, images[0], avail_w, avail_h)
+        else:
+            # Multiple images — place largest one centred, skip the rest
+            # (most slides have one main image; extras are usually logos)
+            largest = max(images, key=lambda i: (i.get("width") or 0) * (i.get("height") or 0))
+            self._place_single_image(slide, largest, avail_w, avail_h)
+
+    def _place_single_image(self, slide, img_data: dict, avail_w, avail_h) -> None:
+        """Place a single image centred in the content area, scaled to fit."""
+        from PIL import Image as PILImage
+
+        blob = img_data["blob"]
+        image_stream = io.BytesIO(blob)
+
+        # Get actual pixel dimensions to compute aspect ratio
+        try:
+            pil_img = PILImage.open(io.BytesIO(blob))
+            px_w, px_h = pil_img.size
+        except Exception:
+            # Fallback: use EMU dimensions from extraction, or assume 4:3
+            px_w = img_data.get("width") or 4
+            px_h = img_data.get("height") or 3
+
+        if px_w == 0 or px_h == 0:
+            return
+
+        aspect = px_w / px_h
+
+        # Scale to fit available area maintaining aspect ratio
+        if aspect >= (avail_w / avail_h):
+            # Width-constrained
+            img_w = avail_w
+            img_h = int(avail_w / aspect)
+        else:
+            # Height-constrained
+            img_h = avail_h
+            img_w = int(avail_h * aspect)
+
+        # Centre in content area
+        left = self.CONTENT_LEFT + (avail_w - img_w) // 2
+        top = self.CONTENT_TOP + (avail_h - img_h) // 2
+
+        slide.shapes.add_picture(image_stream, left, top, img_w, img_h)
 
     def get_placeholder_map(self) -> dict:
         return {

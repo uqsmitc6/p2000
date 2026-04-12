@@ -341,12 +341,133 @@ def convert_presentation(
     output_buffer = io.BytesIO()
     output_prs.save(output_buffer)
     output_buffer.seek(0)
+    output_bytes = output_buffer.getvalue()
 
     logger.info("Conversion complete: %d converted, %d flagged, %d skipped, %d API calls, %d errors",
                 report["slides_converted"], report["slides_flagged"],
                 report["slides_skipped"], report["api_calls"], len(report["errors"]))
 
-    return output_buffer.getvalue(), report
+    # --- Post-conversion verification ---
+    # Send original + branded slide pairs to Claude for QA checking.
+    # Only runs if we have an API key AND source slide images were rendered.
+    if api_key and slide_images:
+        if progress_callback:
+            progress_callback("Verifying converted slides...")
+
+        verification_results = _verify_all_slides(
+            input_bytes, output_bytes, slide_images, report, api_key, model,
+            progress_callback,
+        )
+        report["verification"] = verification_results
+
+        # Count issues
+        v_passed = sum(1 for v in verification_results if v.get("pass") is True)
+        v_issues = sum(1 for v in verification_results if v.get("pass") is False)
+        v_errors = sum(1 for v in verification_results if v.get("pass") is None)
+        report["verification_summary"] = {
+            "total": len(verification_results),
+            "passed": v_passed,
+            "issues_found": v_issues,
+            "errors": v_errors,
+        }
+        report["api_calls"] += len(verification_results)
+
+        logger.info("Verification: %d passed, %d issues found, %d errors",
+                     v_passed, v_issues, v_errors)
+
+        if progress_callback:
+            progress_callback(
+                f"Verification complete: {v_passed} passed, {v_issues} issues found"
+            )
+
+    return output_bytes, report
+
+
+def _verify_all_slides(
+    input_bytes: bytes,
+    output_bytes: bytes,
+    source_images: dict,
+    report: dict,
+    api_key: str,
+    model: str,
+    progress_callback=None,
+) -> list:
+    """
+    Verify all converted slides by comparing source and output images.
+
+    Args:
+        input_bytes: original PPTX bytes
+        output_bytes: branded PPTX bytes
+        source_images: dict mapping source slide_index → PNG bytes
+        report: conversion report (to read slide details)
+        api_key: Anthropic API key
+        model: Claude model to use
+        progress_callback: optional status callback
+
+    Returns:
+        List of verification results, one per converted slide.
+    """
+    from utils.classifier import verify_slide_pair
+
+    # Render the output slides
+    output_images, out_diag = _render_slide_images(output_bytes)
+    if not output_images:
+        logger.warning("Could not render output slides for verification: %s", out_diag)
+        return []
+
+    total_output = len(output_images)
+    results = []
+
+    # Build a mapping from output slide index to source slide index + handler
+    # The report["details"] list tracks which source slides were converted
+    # and in what order they appear in the output.
+    output_idx = 0
+    for detail in report["details"]:
+        if detail["status"] in ("converted", "flagged"):
+            source_slide_num = detail["slide"]
+            handler_name = detail.get("handler", "Unknown")
+
+            # Source image: keyed by 0-based source index
+            if isinstance(source_slide_num, int):
+                source_idx = source_slide_num - 1
+            else:
+                # Auto-inserted slides (e.g. "2 (auto)") — skip verification
+                output_idx += 1
+                continue
+
+            source_img = source_images.get(source_idx)
+            output_img = output_images.get(output_idx)
+
+            if source_img and output_img:
+                if progress_callback:
+                    progress_callback(
+                        f"Verifying slide {output_idx + 1}/{total_output} "
+                        f"(source slide {source_slide_num})..."
+                    )
+
+                v_result = verify_slide_pair(
+                    source_image=source_img,
+                    output_image=output_img,
+                    slide_number=source_slide_num,
+                    total_slides=total_output,
+                    handler_name=handler_name,
+                    api_key=api_key,
+                    model=model,
+                )
+                v_result["source_slide"] = source_slide_num
+                v_result["output_slide"] = output_idx + 1
+                v_result["handler"] = handler_name
+                results.append(v_result)
+
+                # Attach to report detail for UI display
+                detail["verification"] = v_result
+            else:
+                logger.debug("Skipping verification for source %d / output %d (missing image)",
+                             source_slide_num, output_idx + 1)
+
+            output_idx += 1
+
+    return results
 
 
 def _render_slide_images(input_bytes: bytes) -> tuple[dict, str]:

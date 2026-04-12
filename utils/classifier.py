@@ -328,3 +328,137 @@ def classify_slides_batch(
         )
         results.append(result)
     return results
+
+
+# --- Verification (post-conversion QA) ---
+
+VERIFY_PROMPT = """You are reviewing the output of an automated PowerPoint slide converter for a university.
+
+You are given TWO images:
+1. **ORIGINAL** — the source slide from the academic's original deck
+2. **BRANDED** — the converted slide using the UQ (University of Queensland) branded template
+
+Your task is to check that the branded version correctly captures the original content.
+
+Check for:
+- **Missing text**: Any text from the original that is absent or truncated in the branded version
+- **Missing images**: Any photos, diagrams, charts, or visual content from the original that didn't transfer
+- **Layout issues**: Text overlapping edges, content cut off, text running into the footer area
+- **Wrong layout type**: The branded slide uses a layout that doesn't suit the content (e.g. content slide used for a quote, or vice versa)
+- **Content accuracy**: Text that has been altered, reordered, or garbled
+
+This is slide {slide_number} of {total_slides}. It was classified as "{handler_name}".
+
+Respond with ONLY a JSON object (no markdown, no code fences):
+{{"pass": <true or false>, "issues": ["<issue 1>", "<issue 2>", ...], "severity": "<ok|minor|major|critical>"}}
+
+Where severity is:
+- "ok" — no issues found (pass: true)
+- "minor" — cosmetic issues only (extra whitespace, slight font differences)
+- "major" — content partially missing or layout is wrong but usable
+- "critical" — significant content loss, unreadable text, or broken layout"""
+
+
+def verify_slide_pair(
+    source_image: bytes,
+    output_image: bytes,
+    slide_number: int,
+    total_slides: int,
+    handler_name: str,
+    api_key: str,
+    model: str = "claude-sonnet-4-6",
+) -> dict:
+    """
+    Send the original + branded slide images to Claude for QA verification.
+
+    Args:
+        source_image: PNG bytes of the original slide
+        output_image: PNG bytes of the branded slide
+        slide_number: 1-based slide number
+        total_slides: total slides in the deck
+        handler_name: which handler produced the branded slide
+        api_key: Anthropic API key
+        model: Claude model to use
+
+    Returns:
+        {"pass": bool, "issues": list[str], "severity": str}
+        or {"pass": None, "error": str} on failure
+    """
+    try:
+        import anthropic
+
+        logger.info("Verifying slide %d/%d (%s)", slide_number, total_slides, handler_name)
+        client = anthropic.Anthropic(api_key=api_key)
+
+        source_b64 = base64.b64encode(source_image).decode("utf-8")
+        output_b64 = base64.b64encode(output_image).decode("utf-8")
+
+        prompt_text = VERIFY_PROMPT.format(
+            slide_number=slide_number,
+            total_slides=total_slides,
+            handler_name=handler_name,
+        )
+
+        message = client.messages.create(
+            model=model,
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "ORIGINAL slide:",
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": source_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "BRANDED slide:",
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": output_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt_text,
+                    },
+                ],
+            }],
+        )
+
+        response_text = message.content[0].text.strip()
+
+        # Strip markdown code fences
+        if response_text.startswith("```"):
+            lines = response_text.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            response_text = "\n".join(lines).strip()
+
+        result = json.loads(response_text)
+
+        logger.info("Slide %d verification: pass=%s severity=%s issues=%s",
+                     slide_number, result.get("pass"), result.get("severity"),
+                     result.get("issues", []))
+        return {
+            "pass": result.get("pass", True),
+            "issues": result.get("issues", []),
+            "severity": result.get("severity", "ok"),
+        }
+
+    except json.JSONDecodeError as e:
+        logger.error("Slide %d: failed to parse verify response: %s", slide_number, e)
+        return {"pass": None, "issues": [f"Parse error: {e}"], "severity": "unknown"}
+    except Exception as e:
+        logger.error("Slide %d: verify call failed: %s", slide_number, e, exc_info=True)
+        return {"pass": None, "issues": [f"API error: {e}"], "severity": "unknown"}

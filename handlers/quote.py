@@ -269,6 +269,7 @@ class QuoteHandler(SlideHandler):
         Generate a 1920x1080 dark purple gradient PNG for quote backgrounds.
         Uses UQ brand purple (#51247A) transitioning to a deeper shade.
         """
+        import io as _io
         try:
             from PIL import Image, ImageDraw
             width, height = 1920, 1080
@@ -286,7 +287,7 @@ class QuoteHandler(SlideHandler):
                 b = int(b1 + (b2 - b1) * t)
                 draw.line([(0, y), (width, y)], fill=(r, g, b))
 
-            buf = io.BytesIO()
+            buf = _io.BytesIO()
             img.save(buf, format="PNG", optimize=True)
             return buf.getvalue()
         except ImportError:

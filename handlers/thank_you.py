@@ -17,6 +17,7 @@ or falls back to info extracted from the cover slide if available.
 """
 
 import re
+from pptx.util import Emu
 from handlers.base import SlideHandler
 from utils.extractor import extract_text_elements, extract_images
 
@@ -227,6 +228,14 @@ class ThankYouHandler(SlideHandler):
 
         if content.get("email") and self.PH_EMAIL in placeholders:
             placeholders[self.PH_EMAIL].text = content["email"]
+            # Widen the email placeholder — default is only 2.41in which
+            # causes long addresses like j.mccoll-kennedy@business.uq.edu.au
+            # to wrap across 3 lines. Expand to match the name placeholder width.
+            email_ph = placeholders[self.PH_EMAIL]
+            if self.PH_NAME in placeholders:
+                email_ph.width = placeholders[self.PH_NAME].width
+            else:
+                email_ph.width = Emu(3254263)  # same as name/job title placeholders
 
         if content.get("phone") and self.PH_PHONE in placeholders:
             placeholders[self.PH_PHONE].text = content["phone"]

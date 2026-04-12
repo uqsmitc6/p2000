@@ -21,6 +21,7 @@ CRITICAL RULE: Never set font properties on placeholders or table cells.
 """
 
 import re
+from pptx.util import Emu, Pt
 from handlers.base import SlideHandler
 from utils.extractor import extract_text_elements, extract_shapes_with_text
 
@@ -222,6 +223,14 @@ class TitleTableHandler(SlideHandler):
                 for c_idx, cell_text in enumerate(row_data):
                     if c_idx < cols and r_idx < rows:
                         table.cell(r_idx, c_idx).text = cell_text
+
+            # Constrain table height to prevent footer overflow.
+            # The table placeholder is 4141025 EMU tall (~4.53in).
+            # Distribute height equally across rows if there are many.
+            max_table_height = Emu(4141025)
+            max_row_height = max_table_height // rows
+            for row in table.rows:
+                row.height = max_row_height
 
     def get_placeholder_map(self) -> dict:
         return {
