@@ -297,6 +297,7 @@ class TitleContentHandler(SlideHandler):
     #   Level 3 (lvl4pPr): buChar '–', regular, tx1 — sub-bullet
     #   Level 4 (lvl5pPr): buChar '–', regular, tx1 — sub-sub-bullet
     TEMPLATE_HEADING_LEVEL = 0
+    TEMPLATE_BODY_LEVEL = 1      # Plain body text — no bullet, regular weight
     TEMPLATE_BULLET_LEVEL = 2
     TEMPLATE_SUBBULLET_LEVEL = 3
 
@@ -439,6 +440,7 @@ class TitleContentHandler(SlideHandler):
 
         The UQ template defines:
             Level 0: Heading (bold, purple, no bullet)
+            Level 1: Body text (no bullet, regular weight, body colour)
             Level 2: Bullet point (•)
             Level 3: Sub-bullet (–)
 
@@ -447,6 +449,12 @@ class TitleContentHandler(SlideHandler):
             - has_bullet=False (buNone) → no bullet (heading or plain text)
             - has_bullet=None → inherited from layout (assume bulleted if level > 0)
             - level > 0 → indented (sub-item)
+
+        Body text heuristic:
+            Long paragraphs (>=100 chars) or colon-ending intro sentences
+            at source level 0 with inherited bullet + not bold → body text
+            (level 1), not bullet points. These are intro/concluding
+            paragraphs that should render without bullets.
         """
         src_level = rp["level"]
         has_bullet = rp["has_bullet"]
@@ -466,25 +474,29 @@ class TitleContentHandler(SlideHandler):
 
         # Explicit no-bullet (buNone) in source
         if has_bullet is False:
+            # Long text without bullet → body text (no bullet, regular)
+            if len(text) >= 100:
+                return self.TEMPLATE_BODY_LEVEL
             # Short text at level 0 → heading
-            if src_level == 0 and len(text) < 120:
+            if src_level == 0:
                 return self.TEMPLATE_HEADING_LEVEL
-            # Longer text → still heading but could be content
             return self.TEMPLATE_HEADING_LEVEL
 
         # Inherited bullet (has_bullet is None)
         if src_level == 0:
             # Level 0 with inherited formatting — look at the first run's
             # bold state to decide heading vs bullet.
-            # bold=None means inheriting from master, which in academic
-            # slides typically means the master has bold on level-0.
-            # bold=True is explicitly bold. Either indicates a heading.
-            # bold=False is explicitly not bold → likely a bullet item.
             runs = rp.get("runs", [])
             first_run_bold = runs[0].get("bold") if runs else None
             if first_run_bold is None or first_run_bold is True:
                 # Inherits or explicitly bold → heading
                 return self.TEMPLATE_HEADING_LEVEL
+
+            # Not bold at level 0 — could be body text or bullet.
+            # Long text or colon-ending text → body paragraph (no bullet)
+            if len(text) >= 100 or text.endswith(":"):
+                return self.TEMPLATE_BODY_LEVEL
+
             return self.TEMPLATE_BULLET_LEVEL
         elif src_level <= 2:
             return self.TEMPLATE_BULLET_LEVEL

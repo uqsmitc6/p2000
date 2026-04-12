@@ -22,7 +22,7 @@ logger = logging.getLogger("uqslide.renderer")
 
 def render_slides_to_images(
     input_bytes: bytes,
-    dpi: int = 150,
+    dpi: int = 96,
     timeout: int = 120,
 ) -> tuple[list[bytes], str]:
     """
@@ -137,6 +137,9 @@ def render_slides_to_images(
         return [], diag
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        # Free memory after LibreOffice — critical on Render free tier (512MB)
+        import gc
+        gc.collect()
 
 
 def _render_via_pdf(

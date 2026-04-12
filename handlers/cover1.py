@@ -158,13 +158,8 @@ class Cover1Handler(SlideHandler):
             if title_lines > self.MAX_TITLE_LINES:
                 m = self.TITLE_SPLIT_PATTERN.match(result["title"])
                 if m:
-                    # Natural break found — keep punctuation with first part
-                    sep = result["title"][m.end(1):m.start(2)].strip()
-                    if sep in ("&",):
-                        # Keep ampersand with first part for readability
-                        result["title"] = m.group(1).rstrip() + " &"
-                    else:
-                        result["title"] = m.group(1).rstrip()
+                    # Natural break found (colon, dash, em-dash)
+                    result["title"] = m.group(1).rstrip()
                     overflow = m.group(2).strip()
                 else:
                     # No punctuation break — split at word boundary
@@ -187,14 +182,16 @@ class Cover1Handler(SlideHandler):
     # --- Title splitting for long titles ---
 
     # If a title would wrap to more than this many lines at 48pt, try to
-    # split it at a natural break point (colon, dash, em-dash, ampersand)
-    # so the first part stays in the title placeholder and the rest becomes
-    # the first line of the subtitle placeholder (displayed at 18pt bold).
+    # split it at a natural break point (colon, dash, em-dash) so the
+    # first part stays in the title placeholder and the rest becomes the
+    # first line of the subtitle placeholder (displayed at 18pt bold).
     # If no punctuation break exists, fall back to a word-boundary split.
-    MAX_TITLE_LINES = 2
+    # NOTE: '&' is NOT a split character — splitting at '&' leaves an
+    # incomplete fragment (e.g. "Negotiation &").
+    MAX_TITLE_LINES = 3
 
     TITLE_SPLIT_PATTERN = re.compile(
-        r'^(.{8,}?)\s*[:–—\-&]\s*(.+)$', re.DOTALL
+        r'^(.{8,}?)\s*[:–—\-]\s*(.+)$', re.DOTALL
     )
 
     # --- Title line estimation ---

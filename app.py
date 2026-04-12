@@ -6,11 +6,12 @@ Optionally uses Claude Vision API for smarter slide classification.
 """
 
 import base64
+import io
 import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.3"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -176,8 +177,35 @@ if uploaded_file is not None:
     st.markdown(f"**Uploaded:** `{input_filename}` ({len(input_bytes) / 1024:.0f} KB)")
     logger.info("File uploaded: %s (%d KB)", input_filename, len(input_bytes) // 1024)
 
+    # Estimate slide count for memory warning
+    try:
+        from pptx import Presentation as _Prs
+        _tmp_prs = _Prs(io.BytesIO(input_bytes))
+        _est_slides = len(_tmp_prs.slides)
+        del _tmp_prs
+    except Exception:
+        _est_slides = 0
+
+    # Option to skip AI features for large decks (saves memory)
+    use_ai = api_key
+    if api_key and _est_slides > 25:
+        st.warning(
+            f"This deck has **{_est_slides} slides**. AI classification and "
+            "verification require significant memory. If conversion fails, "
+            "try with AI features disabled."
+        )
+        use_ai = st.checkbox(
+            "Enable AI classification & verification",
+            value=False,
+            help="Uses Claude Vision for slide classification and post-conversion QA. "
+                 "Disable for large decks to avoid memory issues on the free tier.",
+        )
+        if use_ai:
+            use_ai = api_key  # Pass the actual key
+
     if st.button("Convert presentation", type="primary"):
-        logger.info("Conversion started: %s (API=%s)", input_filename, bool(api_key))
+        logger.info("Conversion started: %s (API=%s, slides=%d)",
+                     input_filename, bool(use_ai), _est_slides)
         status_area = st.empty()
 
         def update_status(msg):
@@ -188,7 +216,7 @@ if uploaded_file is not None:
                 from converter import convert_presentation
                 output_bytes, report = convert_presentation(
                     input_bytes,
-                    api_key=api_key if api_key else None,
+                    api_key=use_ai if use_ai else None,
                     progress_callback=update_status,
                 )
 
@@ -200,6 +228,11 @@ if uploaded_file is not None:
                 st.session_state["output_filename"] = input_filename.replace(
                     ".pptx", "_BRANDED.pptx"
                 )
+
+                # Free converter memory — images are now in session state
+                import gc
+                del output_bytes, report
+                gc.collect()
 
             except Exception as e:
                 logger.error("Conversion failed: %s", e, exc_info=True)
@@ -284,11 +317,24 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
 
             slide_labels = [_slide_label(d) for d in viewable_slides]
 
+            # Initialise viewer index from session state (set by nav buttons)
+            if "viewer_idx" not in st.session_state:
+                st.session_state["viewer_idx"] = 0
+            # Clamp to valid range (in case slide count changed)
+            viewer_default = min(
+                st.session_state["viewer_idx"], len(viewable_slides) - 1
+            )
+
             selected_idx = st.selectbox(
                 "Select slide to compare",
                 range(len(slide_labels)),
+                index=viewer_default,
                 format_func=lambda i: slide_labels[i],
+                key="slide_selector",
             )
+
+            # Keep session state in sync with selectbox choice
+            st.session_state["viewer_idx"] = selected_idx
 
             detail = viewable_slides[selected_idx]
             source_idx = detail["slide"] - 1

@@ -18,12 +18,15 @@ Tiers in the output report:
     - SKIPPED: no match or classified as "Skip" by the API
 """
 
+import gc
 import io
 import logging
 from pptx import Presentation
 
 from handlers import get_all_handlers, HANDLER_REGISTRY
 from utils.template import open_template, add_slide_from_layout, delete_all_original_slides, move_slide_to_position
+from utils.references import collect_references, format_references_text, has_meaningful_references
+from utils.toc import collect_sections, should_generate_toc, build_toc_content, _has_existing_toc
 
 logger = logging.getLogger("uqslide.converter")
 
@@ -107,6 +110,19 @@ def convert_presentation(
         for i, s in enumerate(input_prs.slides):
             if aoc_handler.detect(s, i) >= 0.9:
                 aoc_source_indices.add(i)
+
+    # --- Collect references & image attributions from source slides ---
+    # Must happen before input_prs is deleted. Results stored for compiled
+    # references slide generation after verification.
+    collected_refs = collect_references(input_prs)
+    if has_meaningful_references(collected_refs):
+        logger.info(
+            "Collected references: %d academic, %d images, %d other",
+            len(collected_refs["academic"]),
+            len(collected_refs["images"]),
+            len(collected_refs["other_sources"]),
+        )
+    report["collected_references"] = collected_refs
 
     # --- Pre-scan for Thank You: only allow ONE closing slide ---
     # Find the last slide that looks like a Thank You (heuristic or position)
@@ -336,6 +352,11 @@ def convert_presentation(
     pre_aoc_buffer.seek(0)
     pre_aoc_bytes = pre_aoc_buffer.getvalue()
 
+    # Free the output Presentation and input Presentation to reclaim RAM
+    # before the memory-heavy rendering/verification step.
+    del output_prs, input_prs, pre_aoc_buffer
+    gc.collect()
+
     logger.info("Conversion complete (pre-AoC): %d converted, %d flagged, %d skipped, %d API calls, %d errors",
                 report["slides_converted"], report["slides_flagged"],
                 report["slides_skipped"], report["api_calls"], len(report["errors"]))
@@ -378,14 +399,17 @@ def convert_presentation(
     report["source_images"] = slide_images  # {source_slide_index: PNG bytes}
     report["output_images"] = output_images  # {output_slide_index: PNG bytes}
 
-    # --- Insert Acknowledgement of Country as slide 2 (AFTER verification) ---
+    # --- Insert auto-generated slides (AFTER verification) ---
     # Load a fresh Presentation from pre-AoC bytes to avoid python-pptx
     # internal part counter issues from double-saving the same object.
+    final_prs = Presentation(io.BytesIO(pre_aoc_bytes))
+    auto_slides_inserted = False
+
+    # 1. Insert Acknowledgement of Country as slide 2
     if aoc_handler:
         try:
             if progress_callback:
                 progress_callback("Inserting Acknowledgement of Country...")
-            final_prs = Presentation(io.BytesIO(pre_aoc_bytes))
             aoc_content = aoc_handler._get_standard_content()
             aoc_slide = add_slide_from_layout(final_prs, aoc_handler.layout_index)
             aoc_handler.fill_slide(aoc_slide, aoc_content)
@@ -393,6 +417,7 @@ def convert_presentation(
             # Move from end (where add_slide puts it) to position 1 (after cover)
             move_slide_to_position(final_prs, len(final_prs.slides) - 1, 1)
             report["slides_converted"] += 1
+            auto_slides_inserted = True
             # Insert AoC detail after cover detail in report
             aoc_detail = {
                 "slide": "2 (auto)",
@@ -404,7 +429,6 @@ def convert_presentation(
                 "all_scores": {},
                 "classification_method": "auto",
             }
-            # Find cover detail index and insert AoC right after it
             cover_idx = next(
                 (i for i, d in enumerate(report["details"])
                  if d.get("handler") == "Cover 1"),
@@ -412,19 +436,93 @@ def convert_presentation(
             )
             report["details"].insert(cover_idx + 1, aoc_detail)
             logger.info("Auto-inserted Acknowledgement of Country as slide 2")
-
-            # Save final output (with AoC)
-            output_buffer = io.BytesIO()
-            final_prs.save(output_buffer)
-            output_buffer.seek(0)
-            output_bytes = output_buffer.getvalue()
         except Exception as e:
             logger.error("Failed to insert AoC slide: %s", e)
             report["errors"].append(f"AoC auto-insert failed: {e}")
-            # Fall back to pre-AoC output
-            output_bytes = pre_aoc_bytes
+
+    # 2. Insert Table of Contents (after Cover + AoC, before content)
+    toc_sections = collect_sections(final_prs)
+    if should_generate_toc(toc_sections) and not _has_existing_toc(final_prs):
+        try:
+            if progress_callback:
+                progress_callback("Generating Table of Contents slide...")
+            _insert_toc_slide(final_prs, toc_sections, programme_name)
+            report["slides_converted"] += 1
+            auto_slides_inserted = True
+            toc_detail = {
+                "slide": "auto (toc)",
+                "status": "converted",
+                "handler": "Contents (compiled)",
+                "confidence": 1.0,
+                "content": {"sections": len(toc_sections)},
+                "preview": f"Table of Contents ({len(toc_sections)} sections, auto-generated)",
+                "all_scores": {},
+                "classification_method": "auto",
+            }
+            # Insert after AoC detail (or after cover if no AoC)
+            aoc_idx = next(
+                (i for i, d in enumerate(report["details"])
+                 if d.get("handler") == "Acknowledgement of Country"),
+                None,
+            )
+            if aoc_idx is not None:
+                report["details"].insert(aoc_idx + 1, toc_detail)
+            else:
+                cover_idx = next(
+                    (i for i, d in enumerate(report["details"])
+                     if d.get("handler") == "Cover 1"),
+                    0,
+                )
+                report["details"].insert(cover_idx + 1, toc_detail)
+            logger.info("Auto-inserted Table of Contents (%d sections)", len(toc_sections))
+        except Exception as e:
+            logger.error("Failed to insert ToC slide: %s", e)
+            report["errors"].append(f"ToC auto-insert failed: {e}")
+
+    # 3. Insert compiled References & Image Credits slide (before Thank You)
+    if has_meaningful_references(collected_refs):
+        try:
+            if progress_callback:
+                progress_callback("Generating References & Image Credits slide...")
+            _insert_compiled_references(final_prs, collected_refs, programme_name)
+            report["slides_converted"] += 1
+            auto_slides_inserted = True
+            # Add detail to report
+            refs_detail = {
+                "slide": "auto (refs)",
+                "status": "converted",
+                "handler": "References (compiled)",
+                "confidence": 1.0,
+                "content": {
+                    "academic_count": len(collected_refs["academic"]),
+                    "image_count": len(collected_refs["images"]),
+                    "other_count": len(collected_refs["other_sources"]),
+                },
+                "preview": "Compiled References & Image Credits (auto-generated)",
+                "all_scores": {},
+                "classification_method": "auto",
+            }
+            report["details"].append(refs_detail)
+            logger.info(
+                "Auto-inserted compiled References slide (%d academic, %d images, %d other)",
+                len(collected_refs["academic"]),
+                len(collected_refs["images"]),
+                len(collected_refs["other_sources"]),
+            )
+        except Exception as e:
+            logger.error("Failed to insert compiled References slide: %s", e)
+            report["errors"].append(f"References slide auto-insert failed: {e}")
+
+    # Save final output
+    if auto_slides_inserted:
+        output_buffer = io.BytesIO()
+        final_prs.save(output_buffer)
+        output_buffer.seek(0)
+        output_bytes = output_buffer.getvalue()
     else:
         output_bytes = pre_aoc_bytes
+
+    del final_prs
 
     return output_bytes, report
 
@@ -528,7 +626,7 @@ def _render_slide_images(input_bytes: bytes) -> tuple[dict, str]:
             logger.error(msg)
             return {}, msg
         logger.info("LibreOffice available, starting render of %d bytes...", len(input_bytes))
-        images, diag = render_slides_to_images(input_bytes, dpi=150)
+        images, diag = render_slides_to_images(input_bytes, dpi=96)
         logger.info("Render complete: %d slide images produced. Diag: %s", len(images), diag)
         return {i: img for i, img in enumerate(images)}, diag
     except Exception as e:
@@ -699,9 +797,21 @@ def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
     from copy import deepcopy
     from pptx.util import Emu
 
-    # TextImage handler already places images via picture placeholder
-    if handler_name == "Text with Image":
+    # Handlers that place images via picture placeholder — skip to avoid dupes
+    if handler_name in ("Text with Image", "Text with Image Alt", "Picture with Caption",
+                         "Top Image + Content", "Picture with Pullout", "Image Collage",
+                         "Text with 4 Images", "Three Column Text & Images",
+                         "Acknowledgement of Country", "Quote", "Quote 2"):
         return
+
+    # Handlers that extract body text into placeholders — only preserve
+    # images, NOT group shapes (group text is already in rich_paragraphs
+    # and the visual group would overlap with the template's content area)
+    TEXT_HANDLERS = {
+        "Title and Content", "Two Content", "Split Content",
+        "References", "Quote",
+    }
+    skip_groups = handler_name in TEXT_HANDLERS
 
     SLIDE_W = 12192000  # EMU
     SLIDE_H = 6858000
@@ -730,7 +840,10 @@ def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
             continue
 
         # Group shapes (shape_type 6) — deep copy XML
+        # Only for handlers without body text placeholders (e.g. Title Only)
         if shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+            if skip_groups:
+                continue
             _copy_group_shape(source_slide, output_slide, shape)
             shapes_copied += 1
 
@@ -809,6 +922,187 @@ def _copy_group_shape(source_slide, output_slide, group_shape):
 
     # Append the copied group to the output slide's shape tree
     output_slide.shapes._spTree.append(new_sp)
+
+
+def _insert_compiled_references(
+    prs,
+    refs: dict,
+    programme_name: str,
+) -> None:
+    """
+    Insert a compiled References & Image Credits slide into the presentation.
+
+    Uses the "Title and Content" layout (index 6). The slide is inserted
+    before the last slide if that slide is a Thank You, otherwise appended
+    at the end.
+
+    CRITICAL: Never set font properties — inherit from template.
+    """
+    import re as _re
+
+    # Build the references text
+    parts = []
+
+    # Academic references
+    if refs["academic"]:
+        for ref in refs["academic"]:
+            parts.append(ref["text"])
+
+    # Image credits — consolidate Adobe Stock IDs
+    if refs["images"]:
+        if parts:
+            parts.append("")  # separator
+        adobe_items = [r for r in refs["images"] if r["type"] == "adobe_stock"]
+        other_items = [r for r in refs["images"] if r["type"] != "adobe_stock"]
+
+        if adobe_items:
+            stock_ids = []
+            for r in adobe_items:
+                match = _re.search(r"(\d{5,})", r["text"])
+                if match:
+                    stock_ids.append(match.group(1))
+                else:
+                    stock_ids.append(r["text"])
+            parts.append("Images licensed through Adobe Stock: " + ", ".join(stock_ids))
+
+        for r in other_items:
+            parts.append(r["text"])
+
+    # Other sources
+    if refs["other_sources"]:
+        if parts:
+            parts.append("")  # separator
+        for ref in refs["other_sources"]:
+            parts.append(ref["text"])
+
+    if not parts:
+        return
+
+    content_text = "\n".join(parts)
+
+    # Determine title based on what we have
+    has_academic = bool(refs["academic"])
+    has_images = bool(refs["images"])
+    if has_academic and has_images:
+        title = "References & Image Credits"
+    elif has_academic:
+        title = "References"
+    else:
+        title = "Image Credits"
+
+    # Create slide using Title and Content layout (index 6)
+    slide = add_slide_from_layout(prs, 6)
+
+    placeholders = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
+
+    # Fill title
+    if 0 in placeholders:
+        placeholders[0].text = title
+
+    # Fill content
+    if 10 in placeholders:
+        placeholders[10].text = content_text
+
+    # Fill footer
+    if 17 in placeholders and programme_name:
+        placeholders[17].text = programme_name
+
+    # Check if last slide before this one is Thank You — if so, move refs before it
+    total = len(prs.slides)
+    if total >= 3:
+        # The new refs slide is at position total-1 (last). Check slide before it.
+        prev_slide = prs.slides[total - 2]
+        prev_text = ""
+        for shape in prev_slide.shapes:
+            if shape.has_text_frame:
+                prev_text += shape.text_frame.text.lower() + " "
+
+        prev_layout = prev_slide.slide_layout.name.lower()
+        is_thank_you = (
+            "thank you" in prev_layout
+            or any(kw in prev_text for kw in [
+                "thank you", "thanks", "questions", "contact",
+                "execed@", "exceed@",
+            ])
+        )
+
+        if is_thank_you:
+            # Move refs slide from end to just before the Thank You
+            move_slide_to_position(prs, total - 1, total - 2)
+            logger.info("Moved References slide before Thank You (position %d)", total - 1)
+
+
+def _insert_toc_slide(
+    prs,
+    sections: list[dict],
+    programme_name: str,
+) -> None:
+    """
+    Insert a Table of Contents slide using the Contents 2 layout (index 4).
+
+    Creates a two-column table with zero-padded numbers and section titles,
+    matching the pattern used in human-branded decks (e.g. Climate Finance).
+
+    The slide is inserted after Cover and AoC — typically position 2 or 3.
+
+    CRITICAL: Never set font properties — inherit from template.
+    """
+    from utils.toc import CONTENTS_2_LAYOUT_INDEX, PH_TITLE, PH_TABLE, PH_FOOTER, PH_SLIDE_NUM, build_toc_content
+
+    rows = build_toc_content(sections)
+    if not rows:
+        return
+
+    # Create the slide
+    slide = add_slide_from_layout(prs, CONTENTS_2_LAYOUT_INDEX)
+    placeholders = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
+
+    # Fill title
+    if PH_TITLE in placeholders:
+        placeholders[PH_TITLE].text = "Contents"
+
+    # Insert table into the table placeholder
+    if PH_TABLE in placeholders:
+        table_ph = placeholders[PH_TABLE]
+        # insert_table returns a GraphicFrame; access .table for the Table object
+        graphic_frame = table_ph.insert_table(rows=len(rows), cols=2)
+        table = graphic_frame.table
+
+        # Populate cells — ONLY set .text, formatting inherits from master
+        for row_idx, (num, title) in enumerate(rows):
+            table.cell(row_idx, 0).text = num
+            table.cell(row_idx, 1).text = title
+
+    # Fill footer
+    if PH_FOOTER in placeholders and programme_name:
+        placeholders[PH_FOOTER].text = programme_name
+
+    # Determine insertion position: after Cover (0) and AoC (1), so position 2
+    # If AoC was inserted, it's at index 1. ToC goes at index 2.
+    # If no AoC, ToC goes at index 1.
+    insert_pos = 1  # Default: after cover
+    if len(prs.slides) >= 2:
+        # Check if slide at index 1 is AoC — check both layout name and title text
+        second_slide = prs.slides[1]
+        second_layout = second_slide.slide_layout.name.lower()
+        second_title = ""
+        for shape in second_slide.shapes:
+            if (shape.has_text_frame and hasattr(shape, 'is_placeholder')
+                    and shape.is_placeholder and shape.placeholder_format.idx == 0):
+                second_title = shape.text_frame.text.lower()
+                break
+        is_aoc = (
+            "acknowledgement" in second_layout
+            or "country" in second_layout
+            or "acknowledgement" in second_title
+            or "country" in second_title
+        )
+        if is_aoc:
+            insert_pos = 2
+
+    # The new slide was appended at the end — move it to the correct position
+    move_slide_to_position(prs, len(prs.slides) - 1, insert_pos)
+    logger.info("Inserted Contents slide at position %d", insert_pos + 1)
 
 
 def _fill_footer_and_slide_num(slide, handler, programme_name: str, slide_number: int):
