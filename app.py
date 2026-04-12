@@ -5,11 +5,12 @@ Upload a PowerPoint file → get a brand-compliant version back.
 Optionally uses Claude Vision API for smarter slide classification.
 """
 
+import base64
 import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -24,7 +25,7 @@ logger = logging.getLogger("uqslide.app")
 st.set_page_config(
     page_title="UQ Slide Converter",
     page_icon="🟣",
-    layout="centered",
+    layout="wide",
 )
 
 # --- Styling ---
@@ -41,6 +42,21 @@ st.markdown("""
     .stDownloadButton > button:hover {
         background-color: #3b1a5a;
         color: white;
+    }
+    /* Make the file uploader drop zone more prominent */
+    [data-testid="stFileUploader"] {
+        border: 2px dashed #51247A;
+        border-radius: 10px;
+        padding: 1rem;
+    }
+    [data-testid="stFileUploader"]:hover {
+        border-color: #3b1a5a;
+        background-color: #f9f5ff;
+    }
+    /* Viewer slide image styling */
+    .slide-viewer img {
+        border: 1px solid #ddd;
+        border-radius: 4px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -148,9 +164,9 @@ def _get_title(detail: dict) -> str:
 
 # --- File upload ---
 uploaded_file = st.file_uploader(
-    "Upload your PowerPoint file",
+    "Drag and drop your PowerPoint file here, or click to browse",
     type=["pptx"],
-    help="Drag and drop or click to browse. Only .pptx files are supported.",
+    help="Only .pptx files are supported. The file will be converted to UQ brand format.",
 )
 
 if uploaded_file is not None:
@@ -170,7 +186,7 @@ if uploaded_file is not None:
         with st.spinner("Analysing and converting slides..."):
             try:
                 from converter import convert_presentation
-                output_bytes, review_bytes, report = convert_presentation(
+                output_bytes, report = convert_presentation(
                     input_bytes,
                     api_key=api_key if api_key else None,
                     progress_callback=update_status,
@@ -179,15 +195,10 @@ if uploaded_file is not None:
                 status_area.empty()
 
                 # Store results in session state so they persist across reruns
-                # (e.g., when the download button is clicked)
                 st.session_state["output_bytes"] = output_bytes
-                st.session_state["review_bytes"] = review_bytes
                 st.session_state["report"] = report
                 st.session_state["output_filename"] = input_filename.replace(
                     ".pptx", "_BRANDED.pptx"
-                )
-                st.session_state["review_filename"] = input_filename.replace(
-                    ".pptx", "_REVIEW.pptx"
                 )
 
             except Exception as e:
@@ -221,26 +232,109 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
         v_issues_count = v_summary.get("issues_found", 0)
         cols[col_idx].metric("QA issues", v_issues_count)
 
-    # --- Downloads ---
-    dl_col1, dl_col2 = st.columns(2)
-    with dl_col1:
-        st.download_button(
-            label=f"Download {output_filename}",
-            data=output_bytes,
-            file_name=output_filename,
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        )
+    # --- Download ---
+    st.download_button(
+        label=f"Download {output_filename}",
+        data=output_bytes,
+        file_name=output_filename,
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
 
-    review_bytes = st.session_state.get("review_bytes")
-    review_filename = st.session_state.get("review_filename", "REVIEW.pptx")
-    if review_bytes:
-        with dl_col2:
-            st.download_button(
-                label=f"Download {review_filename}",
-                data=review_bytes,
-                file_name=review_filename,
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    # --- In-browser slide comparison viewer ---
+    source_images = report.get("source_images", {})
+    output_images = report.get("output_images", {})
+
+    if source_images and output_images:
+        st.markdown("---")
+        st.markdown("### Slide Comparison Viewer")
+        st.caption("Side-by-side comparison of original → branded slides with AI verification feedback.")
+
+        # Build list of viewable slides (converted/flagged with both source and output images)
+        viewable_slides = []
+        for detail in report["details"]:
+            if detail["status"] not in ("converted", "flagged"):
+                continue
+            slide_num = detail["slide"]
+            output_idx = detail.get("output_index")
+            if not isinstance(slide_num, int) or output_idx is None:
+                continue  # Skip auto-inserted slides (AoC)
+            source_idx = slide_num - 1
+            if source_idx in source_images and output_idx in output_images:
+                viewable_slides.append(detail)
+
+        if viewable_slides:
+            # Severity icons
+            severity_icon = {
+                "ok": "✅", "minor": "🟡", "major": "🟠", "critical": "🔴",
+            }
+
+            # Build labels for slide selector
+            def _slide_label(d):
+                handler = d.get("handler", "?")
+                title = _get_title(d)[:35]
+                v = d.get("verification", {})
+                if v.get("pass") is True:
+                    icon = "✅"
+                elif v.get("pass") is False:
+                    sev = v.get("severity", "unknown")
+                    icon = severity_icon.get(sev, "❓")
+                else:
+                    icon = "—"
+                return f"{icon} Slide {d['slide']} → {handler}: {title}"
+
+            slide_labels = [_slide_label(d) for d in viewable_slides]
+
+            selected_idx = st.selectbox(
+                "Select slide to compare",
+                range(len(slide_labels)),
+                format_func=lambda i: slide_labels[i],
             )
+
+            detail = viewable_slides[selected_idx]
+            source_idx = detail["slide"] - 1
+            output_idx = detail.get("output_index")
+
+            # --- Side-by-side images ---
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Original**")
+                st.image(source_images[source_idx], use_container_width=True)
+            with col2:
+                st.markdown("**Branded**")
+                st.image(output_images[output_idx], use_container_width=True)
+
+            # --- Verification result ---
+            v = detail.get("verification", {})
+            if v:
+                if v.get("pass") is True:
+                    st.success("✅ Verification passed — no issues found")
+                elif v.get("pass") is False:
+                    sev = v.get("severity", "unknown")
+                    icon = severity_icon.get(sev, "❓")
+                    issues = v.get("issues", [])
+                    st.error(f"{icon} **{sev.title()}** — {len(issues)} issue(s) found")
+                    for issue in issues:
+                        st.markdown(f"- {issue}")
+                else:
+                    st.warning("Verification could not run for this slide")
+            else:
+                st.info("No verification data (AI verification not enabled)")
+
+            # --- Navigation buttons ---
+            nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+            with nav_col1:
+                if selected_idx > 0:
+                    if st.button("← Previous"):
+                        st.session_state["viewer_idx"] = selected_idx - 1
+                        st.rerun()
+            with nav_col3:
+                if selected_idx < len(viewable_slides) - 1:
+                    if st.button("Next →"):
+                        st.session_state["viewer_idx"] = selected_idx + 1
+                        st.rerun()
+
+    # --- Summary expanders (below viewer) ---
+    st.markdown("---")
 
     # --- Confident conversions ---
     confident = [d for d in report["details"] if d["status"] in ("converted", "replaced")]
@@ -257,7 +351,7 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
     # --- Flagged slides ---
     flagged_items = [d for d in report["details"] if d["status"] == "flagged"]
     if flagged_items:
-        with st.expander(f"Flagged for review ({len(flagged_items)})", expanded=True):
+        with st.expander(f"Flagged for review ({len(flagged_items)})", expanded=False):
             st.warning(
                 "These slides were converted but classification confidence was low. "
                 "Check they've been assigned to the right layout."
@@ -303,7 +397,7 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
                     st.markdown(f"- {err}")
             logger.warning("Conversion completed with %d errors", len(errors))
 
-    # --- Verification Results ---
+    # --- Verification Summary (text-based, below viewer) ---
     verification = report.get("verification", [])
     v_summary = report.get("verification_summary", {})
     if verification:

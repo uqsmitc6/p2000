@@ -23,7 +23,7 @@ import logging
 from pptx import Presentation
 
 from handlers import get_all_handlers, HANDLER_REGISTRY
-from utils.template import open_template, add_slide_from_layout, delete_all_original_slides
+from utils.template import open_template, add_slide_from_layout, delete_all_original_slides, move_slide_to_position
 
 logger = logging.getLogger("uqslide.converter")
 
@@ -38,7 +38,7 @@ def convert_presentation(
     api_key: str = None,
     model: str = "claude-sonnet-4-6",
     progress_callback=None,
-) -> tuple[bytes, bytes | None, dict]:
+) -> tuple[bytes, dict]:
     """
     Convert an uploaded PPTX to brand-compliant format.
 
@@ -50,7 +50,8 @@ def convert_presentation(
         progress_callback: Optional callable(message: str) for status updates
 
     Returns:
-        (output_bytes, review_bytes_or_None, report)
+        (output_bytes, report)
+        report includes source_images and output_images dicts for the viewer.
     """
     logger.info("Starting conversion (%d bytes)", len(input_bytes))
 
@@ -98,16 +99,14 @@ def convert_presentation(
     output_prs = open_template()
     new_slides_added = 0
 
-    # --- Auto-insert Acknowledgement of Country as slide 2 ---
-    # Pre-scan source to find (and later skip) any existing AoC slides
+    # --- Pre-scan for existing Acknowledgement of Country slides ---
+    # These will be skipped (replaced by auto-inserted branded AoC after verification)
     aoc_handler = handlers.get("Acknowledgement of Country")
-    aoc_source_indices = set()  # source slide indices to skip (already consumed)
+    aoc_source_indices = set()
     if aoc_handler:
         for i, s in enumerate(input_prs.slides):
             if aoc_handler.detect(s, i) >= 0.9:
                 aoc_source_indices.add(i)
-        # AoC will be inserted after the cover slide is processed (see below)
-    aoc_inserted = False
 
     # --- Pre-scan for Thank You: only allow ONE closing slide ---
     # Find the last slide that looks like a Thank You (heuristic or position)
@@ -213,6 +212,14 @@ def convert_presentation(
                                     slide_idx + 1, (last_thank_you_idx or -1) + 1)
                         best_name = "Title and Content"
                         best_confidence = api_confidence
+                    # Guard: Title Only should not be used when there's
+                    # significant body text — the content would be lost.
+                    # Downgrade to Title and Content to preserve text.
+                    elif api_type == "Title Only" and _slide_has_body_text(slide, min_chars=40):
+                        logger.info("Slide %d: API suggested Title Only but slide has body text — using Title and Content",
+                                    slide_idx + 1)
+                        best_name = "Title and Content"
+                        best_confidence = api_confidence
                     else:
                         # API classified it — use that handler
                         best_name = api_type
@@ -246,8 +253,11 @@ def convert_presentation(
                 new_slide = add_slide_from_layout(output_prs, layout_idx)
                 best_handler.fill_slide(new_slide, content)
 
-                # Remove unused subtitle placeholders (removes dashed boxes)
-                _cleanup_empty_subtitle(new_slide, best_handler, content)
+                # Preserve visual shapes (diagrams, images) from source
+                _preserve_visual_shapes(slide, new_slide, best_handler.name)
+
+                # Remove unfilled placeholders (prevents template prompt text showing)
+                _cleanup_empty_placeholders(new_slide, best_handler, content)
 
                 # Populate footer and slide number on every converted slide
                 _fill_footer_and_slide_num(
@@ -255,31 +265,6 @@ def convert_presentation(
                 )
 
                 new_slides_added += 1
-
-                # Auto-insert AoC after cover slide
-                if not aoc_inserted and best_handler.name == "Cover 1" and aoc_handler:
-                    try:
-                        aoc_content = aoc_handler._get_standard_content()
-                        aoc_slide = add_slide_from_layout(output_prs, aoc_handler.layout_index)
-                        aoc_handler.fill_slide(aoc_slide, aoc_content)
-                        _fill_footer_and_slide_num(aoc_slide, aoc_handler, programme_name, 2)
-                        new_slides_added += 1
-                        aoc_inserted = True
-                        report["slides_converted"] += 1
-                        report["details"].append({
-                            "slide": "2 (auto)",
-                            "status": "converted",
-                            "handler": "Acknowledgement of Country",
-                            "confidence": 1.0,
-                            "content": aoc_content,
-                            "preview": "Acknowledgement of Country (auto-inserted)",
-                            "all_scores": {},
-                            "classification_method": "auto",
-                        })
-                        logger.info("Auto-inserted Acknowledgement of Country as slide 2")
-                    except Exception as e:
-                        logger.error("Failed to insert AoC slide: %s", e)
-                        report["errors"].append(f"AoC auto-insert failed: {e}")
 
                 if best_confidence >= CONFIDENT_THRESHOLD:
                     status = "converted"
@@ -337,25 +322,34 @@ def convert_presentation(
     if new_slides_added > 0:
         delete_all_original_slides(output_prs, num_new_slides=new_slides_added)
 
-    # Save
-    output_buffer = io.BytesIO()
-    output_prs.save(output_buffer)
-    output_buffer.seek(0)
-    output_bytes = output_buffer.getvalue()
+    # --- Assign output_index to each converted/flagged detail ---
+    # At this point the output has NO AoC — clean 1:1 source→output mapping.
+    output_idx_counter = 0
+    for detail in report["details"]:
+        if detail["status"] in ("converted", "flagged"):
+            detail["output_index"] = output_idx_counter
+            output_idx_counter += 1
 
-    logger.info("Conversion complete: %d converted, %d flagged, %d skipped, %d API calls, %d errors",
+    # Save pre-AoC output for verification (1:1 mapping, no offset issues)
+    pre_aoc_buffer = io.BytesIO()
+    output_prs.save(pre_aoc_buffer)
+    pre_aoc_buffer.seek(0)
+    pre_aoc_bytes = pre_aoc_buffer.getvalue()
+
+    logger.info("Conversion complete (pre-AoC): %d converted, %d flagged, %d skipped, %d API calls, %d errors",
                 report["slides_converted"], report["slides_flagged"],
                 report["slides_skipped"], report["api_calls"], len(report["errors"]))
 
     # --- Post-conversion verification ---
     # Send original + branded slide pairs to Claude for QA checking.
-    # Only runs if we have an API key AND source slide images were rendered.
+    # Runs on pre-AoC output so source→output mapping is clean 1:1.
+    output_images = {}
     if api_key and slide_images:
         if progress_callback:
             progress_callback("Verifying converted slides...")
 
-        verification_results = _verify_all_slides(
-            input_bytes, output_bytes, slide_images, report, api_key, model,
+        verification_results, output_images = _verify_all_slides(
+            pre_aoc_bytes, slide_images, report, api_key, model,
             progress_callback,
         )
         report["verification"] = verification_results
@@ -380,42 +374,86 @@ def convert_presentation(
                 f"Verification complete: {v_passed} passed, {v_issues} issues found"
             )
 
-    # --- Build review copy (interleaved original + branded) ---
-    if progress_callback:
-        progress_callback("Building review copy...")
-    try:
-        review_bytes = _build_review_copy(input_bytes, output_bytes, report)
-    except Exception as e:
-        logger.error("Failed to build review copy: %s", e, exc_info=True)
-        report["errors"].append(f"Review copy failed: {e}")
-        review_bytes = None
+    # --- Store rendered images in report for in-browser viewer ---
+    report["source_images"] = slide_images  # {source_slide_index: PNG bytes}
+    report["output_images"] = output_images  # {output_slide_index: PNG bytes}
 
-    return output_bytes, review_bytes, report
+    # --- Insert Acknowledgement of Country as slide 2 (AFTER verification) ---
+    # Load a fresh Presentation from pre-AoC bytes to avoid python-pptx
+    # internal part counter issues from double-saving the same object.
+    if aoc_handler:
+        try:
+            if progress_callback:
+                progress_callback("Inserting Acknowledgement of Country...")
+            final_prs = Presentation(io.BytesIO(pre_aoc_bytes))
+            aoc_content = aoc_handler._get_standard_content()
+            aoc_slide = add_slide_from_layout(final_prs, aoc_handler.layout_index)
+            aoc_handler.fill_slide(aoc_slide, aoc_content)
+            _fill_footer_and_slide_num(aoc_slide, aoc_handler, programme_name, 2)
+            # Move from end (where add_slide puts it) to position 1 (after cover)
+            move_slide_to_position(final_prs, len(final_prs.slides) - 1, 1)
+            report["slides_converted"] += 1
+            # Insert AoC detail after cover detail in report
+            aoc_detail = {
+                "slide": "2 (auto)",
+                "status": "converted",
+                "handler": "Acknowledgement of Country",
+                "confidence": 1.0,
+                "content": aoc_content,
+                "preview": "Acknowledgement of Country (auto-inserted)",
+                "all_scores": {},
+                "classification_method": "auto",
+            }
+            # Find cover detail index and insert AoC right after it
+            cover_idx = next(
+                (i for i, d in enumerate(report["details"])
+                 if d.get("handler") == "Cover 1"),
+                0,
+            )
+            report["details"].insert(cover_idx + 1, aoc_detail)
+            logger.info("Auto-inserted Acknowledgement of Country as slide 2")
+
+            # Save final output (with AoC)
+            output_buffer = io.BytesIO()
+            final_prs.save(output_buffer)
+            output_buffer.seek(0)
+            output_bytes = output_buffer.getvalue()
+        except Exception as e:
+            logger.error("Failed to insert AoC slide: %s", e)
+            report["errors"].append(f"AoC auto-insert failed: {e}")
+            # Fall back to pre-AoC output
+            output_bytes = pre_aoc_bytes
+    else:
+        output_bytes = pre_aoc_bytes
+
+    return output_bytes, report
 
 
 def _verify_all_slides(
-    input_bytes: bytes,
     output_bytes: bytes,
     source_images: dict,
     report: dict,
     api_key: str,
     model: str,
     progress_callback=None,
-) -> list:
+) -> tuple[list, dict]:
     """
     Verify all converted slides by comparing source and output images.
 
+    The output_bytes should be the pre-AoC output (no Acknowledgement of
+    Country inserted yet) so source→output mapping is clean 1:1.
+
     Args:
-        input_bytes: original PPTX bytes
-        output_bytes: branded PPTX bytes
+        output_bytes: branded PPTX bytes (pre-AoC)
         source_images: dict mapping source slide_index → PNG bytes
-        report: conversion report (to read slide details)
+        report: conversion report (to read slide details with output_index)
         api_key: Anthropic API key
         model: Claude model to use
         progress_callback: optional status callback
 
     Returns:
-        List of verification results, one per converted slide.
+        Tuple of (list of verification results, output_images dict).
+        output_images maps output_slide_index → PNG bytes.
     """
     from utils.classifier import verify_slide_pair
 
@@ -423,61 +461,56 @@ def _verify_all_slides(
     output_images, out_diag = _render_slide_images(output_bytes)
     if not output_images:
         logger.warning("Could not render output slides for verification: %s", out_diag)
-        return []
+        return [], {}
 
     total_output = len(output_images)
     results = []
 
-    # Build a mapping from output slide index to source slide index + handler
-    # The report["details"] list tracks which source slides were converted
-    # and in what order they appear in the output.
-    output_idx = 0
+    # Walk details — each converted/flagged detail has an output_index
+    # assigned earlier. The mapping is now 1:1 (no AoC offset).
     for detail in report["details"]:
-        if detail["status"] in ("converted", "flagged"):
-            source_slide_num = detail["slide"]
-            handler_name = detail.get("handler", "Unknown")
+        if detail["status"] not in ("converted", "flagged"):
+            continue
 
-            # Source image: keyed by 0-based source index
-            if isinstance(source_slide_num, int):
-                source_idx = source_slide_num - 1
-            else:
-                # Auto-inserted slides (e.g. "2 (auto)") — skip verification
-                output_idx += 1
-                continue
+        source_slide_num = detail["slide"]
+        handler_name = detail.get("handler", "Unknown")
+        output_idx = detail.get("output_index")
 
-            source_img = source_images.get(source_idx)
-            output_img = output_images.get(output_idx)
+        if not isinstance(source_slide_num, int) or output_idx is None:
+            continue
 
-            if source_img and output_img:
-                if progress_callback:
-                    progress_callback(
-                        f"Verifying slide {output_idx + 1}/{total_output} "
-                        f"(source slide {source_slide_num})..."
-                    )
+        source_idx = source_slide_num - 1
+        source_img = source_images.get(source_idx)
+        output_img = output_images.get(output_idx)
 
-                v_result = verify_slide_pair(
-                    source_image=source_img,
-                    output_image=output_img,
-                    slide_number=source_slide_num,
-                    total_slides=total_output,
-                    handler_name=handler_name,
-                    api_key=api_key,
-                    model=model,
+        if source_img and output_img:
+            if progress_callback:
+                progress_callback(
+                    f"Verifying slide {output_idx + 1}/{total_output} "
+                    f"(source slide {source_slide_num})..."
                 )
-                v_result["source_slide"] = source_slide_num
-                v_result["output_slide"] = output_idx + 1
-                v_result["handler"] = handler_name
-                results.append(v_result)
 
-                # Attach to report detail for UI display
-                detail["verification"] = v_result
-            else:
-                logger.debug("Skipping verification for source %d / output %d (missing image)",
-                             source_slide_num, output_idx + 1)
+            v_result = verify_slide_pair(
+                source_image=source_img,
+                output_image=output_img,
+                slide_number=source_slide_num,
+                total_slides=total_output,
+                handler_name=handler_name,
+                api_key=api_key,
+                model=model,
+            )
+            v_result["source_slide"] = source_slide_num
+            v_result["output_slide"] = output_idx + 1
+            v_result["handler"] = handler_name
+            results.append(v_result)
 
-            output_idx += 1
+            # Attach to report detail for UI display
+            detail["verification"] = v_result
+        else:
+            logger.debug("Skipping verification for source %d / output %d (missing image)",
+                         source_slide_num, output_idx + 1)
 
-    return results
+    return results, output_images
 
 
 def _render_slide_images(input_bytes: bytes) -> tuple[dict, str]:
@@ -516,6 +549,36 @@ def _classify_with_api(slide, slide_index, total_slides, api_key, model,
     except Exception as e:
         logger.error("API classifier failed for slide %d: %s", slide_index + 1, e, exc_info=True)
         return None
+
+
+def _slide_has_body_text(slide, min_chars: int = 30) -> bool:
+    """
+    Check if a slide has significant body text (non-title text).
+    Used to guard against API misclassifying text-heavy slides as Title Only.
+    Counts text from content placeholders, text boxes, and group shapes.
+    """
+    body_text_len = 0
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        # Skip title placeholder (idx 0) and footer/slide number
+        if hasattr(shape, 'is_placeholder') and shape.is_placeholder:
+            ph_idx = shape.placeholder_format.idx
+            if ph_idx in (0, 17, 18):  # title, footer, slide number
+                continue
+        text = shape.text_frame.text.strip()
+        body_text_len += len(text)
+    # Also check group shapes for text
+    for shape in slide.shapes:
+        if shape.shape_type == 6:  # Group
+            try:
+                from utils.extractor import _extract_group_text
+                group_texts = _extract_group_text(shape)
+                for text in group_texts:
+                    body_text_len += len(text) if isinstance(text, str) else len(text.get("text", ""))
+            except Exception:
+                pass
+    return body_text_len >= min_chars
 
 
 def _get_slide_preview(slide) -> str:
@@ -590,25 +653,162 @@ def _detect_programme_name(prs) -> str:
     return best_text if len(best_text) < 120 else ""
 
 
-def _cleanup_empty_subtitle(slide, handler, content: dict):
+def _cleanup_empty_placeholders(slide, handler, content: dict):
     """
-    Remove subtitle placeholder if the handler didn't populate it.
-    Prevents the dashed template prompt box from showing on output slides.
+    Remove unfilled placeholders so template prompt text doesn't show through.
+    Checks all keys in the handler's placeholder map (subtitle, entity, etc.)
+    and removes the XML element for any that weren't populated by content.
+    Skips title, footer, and slide_num (always handled separately).
     """
     ph_map = handler.get_placeholder_map()
-    subtitle_idx = ph_map.get("subtitle")
-    if subtitle_idx is None:
-        return  # Handler has no subtitle placeholder
-
-    # Check if content actually provided a subtitle
-    if content and content.get("subtitle"):
-        return  # Subtitle was filled — keep it
-
-    # Remove the empty placeholder element from the slide XML
     placeholders = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
-    if subtitle_idx in placeholders:
-        sp = placeholders[subtitle_idx]._element
-        sp.getparent().remove(sp)
+
+    # Keys that are always handled separately — don't remove
+    skip_keys = {"title", "footer", "slide_num"}
+
+    for key, ph_idx in ph_map.items():
+        if key in skip_keys:
+            continue
+        if ph_idx is None:
+            continue
+        # If the content has a value for this key, keep the placeholder
+        if content and content.get(key):
+            continue
+        # Remove the empty placeholder element from the slide XML
+        if ph_idx in placeholders:
+            sp = placeholders[ph_idx]._element
+            sp.getparent().remove(sp)
+
+
+def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
+    """
+    Copy non-placeholder visual shapes (group shapes, images) from the
+    source slide to the output slide.  This preserves diagrams, charts,
+    and images that the handler's text-based fill_slide can't reproduce.
+
+    Skips:
+    - Text placeholders (already handled by the handler)
+    - Very large background images (> 70% of slide in both dimensions)
+    - Very small shapes (logos, icons < 8% of slide width)
+    - TextImage handler slides (images are already placed via placeholder)
+
+    Uses XML deep-copy for group shapes and python-pptx add_picture
+    for image shapes (to correctly transfer image relationships).
+    """
+    import io
+    from copy import deepcopy
+    from pptx.util import Emu
+
+    # TextImage handler already places images via picture placeholder
+    if handler_name == "Text with Image":
+        return
+
+    SLIDE_W = 12192000  # EMU
+    SLIDE_H = 6858000
+
+    shapes_copied = 0
+
+    for shape in source_slide.shapes:
+        # Skip placeholders — these are handled by the handler
+        if hasattr(shape, 'is_placeholder') and shape.is_placeholder:
+            continue
+
+        shape_type = shape.shape_type
+
+        # Get dimensions for filtering
+        w = shape.width or 0
+        h = shape.height or 0
+        w_pct = w / SLIDE_W if SLIDE_W else 0
+        h_pct = h / SLIDE_H if SLIDE_H else 0
+
+        # Skip very large shapes (backgrounds, decorative fills)
+        if w_pct > 0.70 and h_pct > 0.50:
+            continue
+
+        # Skip very small shapes (logos, tiny icons)
+        if w_pct < 0.08 and h_pct < 0.08:
+            continue
+
+        # Group shapes (shape_type 6) — deep copy XML
+        if shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+            _copy_group_shape(source_slide, output_slide, shape)
+            shapes_copied += 1
+
+        # Picture shapes (shape_type 13) — copy via add_picture
+        elif shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+            try:
+                blob = shape.image.blob
+                content_type = shape.image.content_type
+                left = shape.left
+                top = shape.top
+                width = shape.width
+                height = shape.height
+                image_stream = io.BytesIO(blob)
+                output_slide.shapes.add_picture(
+                    image_stream, left, top, width, height
+                )
+                shapes_copied += 1
+            except Exception:
+                pass  # Skip images that can't be extracted
+
+        # Shapes with image fill (e.g. rectangles with picture fills)
+        elif hasattr(shape, 'image'):
+            try:
+                blob = shape.image.blob
+                left = shape.left
+                top = shape.top
+                width = shape.width
+                height = shape.height
+                image_stream = io.BytesIO(blob)
+                output_slide.shapes.add_picture(
+                    image_stream, left, top, width, height
+                )
+                shapes_copied += 1
+            except Exception:
+                pass
+
+    if shapes_copied:
+        logger.info("  Preserved %d visual shape(s) from source slide", shapes_copied)
+
+
+def _copy_group_shape(source_slide, output_slide, group_shape):
+    """
+    Deep copy a group shape from source to output slide.
+
+    Group shapes may contain embedded images (via relationships).
+    We copy the XML and re-create any image relationships on the output slide.
+    """
+    from copy import deepcopy
+    from lxml import etree
+
+    nsmap = {
+        'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+        'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    }
+
+    # Deep copy the group shape XML
+    new_sp = deepcopy(group_shape._element)
+
+    # Find all relationship references (r:embed, r:link) within the group
+    # and re-create them on the output slide
+    src_part = source_slide.part
+    dst_part = output_slide.part
+
+    for elem in new_sp.iter():
+        for attr_name in ('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed',
+                          '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link'):
+            old_rId = elem.get(attr_name)
+            if old_rId:
+                try:
+                    rel = src_part.rels[old_rId]
+                    # Copy the target part to the output slide
+                    new_rId = dst_part.relate_to(rel.target_part, rel.reltype)
+                    elem.set(attr_name, new_rId)
+                except (KeyError, Exception):
+                    pass  # Skip broken relationships
+
+    # Append the copied group to the output slide's shape tree
+    output_slide.shapes._spTree.append(new_sp)
 
 
 def _fill_footer_and_slide_num(slide, handler, programme_name: str, slide_number: int):
@@ -628,156 +828,6 @@ def _fill_footer_and_slide_num(slide, handler, programme_name: str, slide_number
     slide_num_idx = ph_map.get("slide_num")
     if slide_num_idx is not None and slide_num_idx in placeholders:
         placeholders[slide_num_idx].text = str(slide_number)
-
-
-def _build_review_copy(
-    input_bytes: bytes,
-    output_bytes: bytes,
-    report: dict,
-) -> bytes | None:
-    """
-    Build an interleaved review PPTX: original slide → branded slide, repeated.
-
-    This lets a human reviewer quickly flip through to compare each source
-    slide against its branded counterpart.
-
-    Strategy:
-        1. Open both source and output presentations.
-        2. Walk the report details to find converted/flagged slides.
-        3. For each, copy the source slide then the output slide into a
-           new blank presentation.
-
-    Returns:
-        PPTX bytes for the review copy, or None if building fails.
-    """
-    from pptx.util import Inches, Pt, Emu
-    from copy import deepcopy
-    from lxml import etree
-
-    source_prs = Presentation(io.BytesIO(input_bytes))
-    output_prs = Presentation(io.BytesIO(output_bytes))
-    review_prs = Presentation()
-
-    # Match slide dimensions to the output
-    review_prs.slide_width = output_prs.slide_width
-    review_prs.slide_height = output_prs.slide_height
-
-    # Use a blank layout from the review presentation
-    blank_layout = review_prs.slide_layouts[6]  # Typically "Blank"
-
-    # Track which output slide index corresponds to each source slide
-    output_idx = 0
-    source_slides = list(source_prs.slides)
-    output_slides = list(output_prs.slides)
-
-    for detail in report["details"]:
-        if detail["status"] not in ("converted", "flagged"):
-            continue
-
-        source_slide_num = detail["slide"]
-        handler_name = detail.get("handler", "?")
-
-        # Auto-inserted slides (e.g. AoC "2 (auto)") have no source original,
-        # but still occupy an output slot. Include them branded-only.
-        if not isinstance(source_slide_num, int):
-            if output_idx < len(output_slides):
-                _copy_slide_to(output_prs, output_slides[output_idx], review_prs, blank_layout,
-                               label=f"AUTO-INSERTED — {handler_name}")
-            output_idx += 1
-            continue
-
-        source_idx = source_slide_num - 1
-
-        # --- Add source slide ---
-        if source_idx < len(source_slides):
-            _copy_slide_to(source_prs, source_slides[source_idx], review_prs, blank_layout,
-                           label=f"ORIGINAL — Slide {source_slide_num}")
-
-        # --- Add branded slide ---
-        if output_idx < len(output_slides):
-            _copy_slide_to(output_prs, output_slides[output_idx], review_prs, blank_layout,
-                           label=f"BRANDED — Slide {source_slide_num} → {handler_name}")
-
-        output_idx += 1
-
-    if len(review_prs.slides) == 0:
-        logger.warning("Review copy has no slides — skipping")
-        return None
-
-    buf = io.BytesIO()
-    review_prs.save(buf)
-    buf.seek(0)
-    logger.info("Review copy built: %d slides", len(review_prs.slides))
-    return buf.getvalue()
-
-
-def _copy_slide_to(source_prs, source_slide, target_prs, blank_layout, label: str = ""):
-    """
-    Copy all shapes from a source slide into a new blank slide in the target
-    presentation. Also adds a small label in the top-left corner.
-
-    This is a simplified copy — it transfers shapes via XML cloning but
-    does not copy slide backgrounds, master styles, or media relationships
-    that live outside the shape tree. For review purposes this is sufficient.
-    """
-    from pptx.util import Pt, Emu, Inches
-    from lxml import etree
-    import copy as _copy
-
-    new_slide = target_prs.slides.add_slide(blank_layout)
-
-    # Copy the slide background if it has one
-    src_bg = source_slide.background
-    if src_bg is not None and src_bg._element is not None:
-        bg_elem = src_bg._element
-        # Check if it has fill (not just inherited)
-        if bg_elem.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}solidFill') is not None or \
-           bg_elem.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}gradFill') is not None:
-            new_bg = _copy.deepcopy(bg_elem)
-            new_slide.background._element.getparent().replace(
-                new_slide.background._element, new_bg
-            )
-
-    # Copy shapes from the source slide's shape tree
-    for shape in source_slide.shapes:
-        try:
-            el = _copy.deepcopy(shape._element)
-            new_slide.shapes._spTree.append(el)
-
-            # If the shape references an image, copy the image relationship
-            blip_elems = el.findall('.//{http://schemas.openxmlformats.org/drawingml/2006/main}blip')
-            for blip in blip_elems:
-                embed_attr = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
-                if embed_attr and embed_attr in source_slide.part.rels:
-                    try:
-                        src_rel = source_slide.part.rels[embed_attr]
-                        src_part = src_rel.target_part
-                        new_rid = new_slide.part.relate_to(src_part, src_rel.reltype)
-                        blip.set('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed', new_rid)
-                    except Exception:
-                        pass  # Image won't render but shape still copies
-        except Exception as e:
-            logger.debug("Could not copy shape '%s': %s", getattr(shape, 'name', '?'), e)
-
-    # Add a small label textbox in the top-left corner
-    if label:
-        from pptx.util import Pt, Inches
-        txBox = new_slide.shapes.add_textbox(
-            Inches(0.2), Inches(0.05), Inches(5), Inches(0.3)
-        )
-        tf = txBox.text_frame
-        tf.text = label
-        for para in tf.paragraphs:
-            for run in para.runs:
-                run.font.size = Pt(10)
-                run.font.bold = True
-                from pptx.dml.color import RGBColor
-                if "ORIGINAL" in label:
-                    run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)  # Red
-                elif "AUTO-INSERTED" in label:
-                    run.font.color.rgb = RGBColor(0x00, 0x66, 0x99)  # Teal blue
-                else:
-                    run.font.color.rgb = RGBColor(0x51, 0x24, 0x7A)  # UQ Purple
 
 
 def convert_cover_only(input_bytes: bytes) -> tuple[bytes, dict]:

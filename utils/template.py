@@ -86,3 +86,18 @@ def delete_all_original_slides(prs: Presentation, num_new_slides: int = 1):
     num_original = len(prs.slides) - num_new_slides
     for i in range(num_original - 1, -1, -1):
         delete_slide(prs, i)
+
+
+def move_slide_to_position(prs: Presentation, from_index: int, to_index: int):
+    """
+    Move a slide from one position to another by reordering the sldIdLst XML.
+
+    Args:
+        prs: Presentation object
+        from_index: Current 0-based index of the slide to move
+        to_index: Target 0-based index where the slide should end up
+    """
+    sldIdLst = prs.slides._sldIdLst
+    sldId = sldIdLst[from_index]
+    sldIdLst.remove(sldId)
+    sldIdLst.insert(to_index, sldId)

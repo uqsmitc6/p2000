@@ -150,16 +150,33 @@ class Cover1Handler(SlideHandler):
             result["subtitle"] = "\n".join(parts)
 
         # If title is very long, try to split at a natural break point
-        # (colon, dash, em-dash) so the first part stays in the big title
-        # and the rest becomes the first line of the subtitle.
+        # (colon, dash, em-dash, ampersand) so the first part stays in
+        # the big title and the rest becomes the first line of the subtitle.
+        # Fallback: split at a word boundary at MAX_TITLE_LINES.
         if result["title"]:
             title_lines = self._estimate_title_lines(result["title"])
             if title_lines > self.MAX_TITLE_LINES:
                 m = self.TITLE_SPLIT_PATTERN.match(result["title"])
                 if m:
-                    result["title"] = m.group(1).rstrip() + ":"
+                    # Natural break found — keep punctuation with first part
+                    sep = result["title"][m.end(1):m.start(2)].strip()
+                    if sep in ("&",):
+                        # Keep ampersand with first part for readability
+                        result["title"] = m.group(1).rstrip() + " &"
+                    else:
+                        result["title"] = m.group(1).rstrip()
                     overflow = m.group(2).strip()
-                    # Prepend overflow to subtitle
+                else:
+                    # No punctuation break — split at word boundary
+                    words = result["title"].split()
+                    keep, overflow_words = self._word_boundary_split_indices(
+                        words, self.MAX_TITLE_LINES
+                    )
+                    result["title"] = " ".join(words[:keep])
+                    overflow = " ".join(words[keep:])
+
+                # Prepend overflow to subtitle
+                if overflow:
                     if result["subtitle"]:
                         result["subtitle"] = overflow + "\n" + result["subtitle"]
                     else:
@@ -170,25 +187,27 @@ class Cover1Handler(SlideHandler):
     # --- Title splitting for long titles ---
 
     # If a title would wrap to more than this many lines at 48pt, try to
-    # split it at a natural break point (colon, dash, em-dash) so the first
-    # part stays in the title placeholder and the rest becomes the first
-    # line of the subtitle placeholder (displayed at 18pt bold).
-    MAX_TITLE_LINES = 3
+    # split it at a natural break point (colon, dash, em-dash, ampersand)
+    # so the first part stays in the title placeholder and the rest becomes
+    # the first line of the subtitle placeholder (displayed at 18pt bold).
+    # If no punctuation break exists, fall back to a word-boundary split.
+    MAX_TITLE_LINES = 2
 
     TITLE_SPLIT_PATTERN = re.compile(
-        r'^(.{15,}?)\s*[:–—-]\s*(.+)$', re.DOTALL
+        r'^(.{8,}?)\s*[:–—\-&]\s*(.+)$', re.DOTALL
     )
 
     # --- Title line estimation ---
 
-    # Calibrated against real outputs: at 48pt Arial in a 5.10" placeholder,
-    # approximately 20 characters fit per line with word-wrap.
-    CHARS_PER_LINE = 20
+    # Conservative estimate for 48pt Arial in a ~5" placeholder.
+    # Real PowerPoint rendering wraps tighter than simple char-count;
+    # 18 chars/line avoids under-counting wraps.
+    CHARS_PER_LINE = 18
 
     # How much to shift the subtitle down per extra title line beyond 2.
-    # 0.5 inches per line keeps the visual gap consistent without pushing
-    # the subtitle off the slide. (0.5" ≈ 457200 EMU)
-    SHIFT_PER_EXTRA_LINE_EMU = 457200
+    # 0.6 inches per line keeps the visual gap consistent without pushing
+    # the subtitle off the slide. (0.6" ≈ 548640 EMU)
+    SHIFT_PER_EXTRA_LINE_EMU = 548640
 
     def _estimate_title_lines(self, title: str) -> int:
         """
@@ -213,6 +232,31 @@ class Cover1Handler(SlideHandler):
                 current_line_len = word_len
 
         return lines
+
+    def _word_boundary_split_indices(self, words: list, max_lines: int) -> tuple:
+        """
+        Find the word index at which the title exceeds max_lines.
+        Returns (keep_count, overflow_count) — number of words for each part.
+        """
+        lines = 1
+        current_line_len = 0
+        split_word_idx = len(words)  # default: no split
+
+        for i, word in enumerate(words):
+            word_len = len(word)
+            if current_line_len == 0:
+                current_line_len = word_len
+            elif current_line_len + 1 + word_len <= self.CHARS_PER_LINE:
+                current_line_len += 1 + word_len
+            else:
+                lines += 1
+                current_line_len = word_len
+
+            if lines > max_lines:
+                split_word_idx = i
+                break
+
+        return split_word_idx, len(words) - split_word_idx
 
     # --- Output ---
 
