@@ -273,6 +273,12 @@ class TitleContentHandler(SlideHandler):
 
             ph.text = content["content"]
 
+            # Override the master's level-1 default which is bold + accent1.
+            # Body text should be regular weight.
+            for para in ph.text_frame.paragraphs:
+                for run in para.runs:
+                    run.font.bold = False
+
         # Footer
         if content.get("footer") and self.PH_FOOTER in placeholders:
             placeholders[self.PH_FOOTER].text = content["footer"]

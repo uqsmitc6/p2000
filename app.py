@@ -9,7 +9,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
@@ -170,7 +170,7 @@ if uploaded_file is not None:
         with st.spinner("Analysing and converting slides..."):
             try:
                 from converter import convert_presentation
-                output_bytes, report = convert_presentation(
+                output_bytes, review_bytes, report = convert_presentation(
                     input_bytes,
                     api_key=api_key if api_key else None,
                     progress_callback=update_status,
@@ -181,9 +181,13 @@ if uploaded_file is not None:
                 # Store results in session state so they persist across reruns
                 # (e.g., when the download button is clicked)
                 st.session_state["output_bytes"] = output_bytes
+                st.session_state["review_bytes"] = review_bytes
                 st.session_state["report"] = report
                 st.session_state["output_filename"] = input_filename.replace(
                     ".pptx", "_BRANDED.pptx"
+                )
+                st.session_state["review_filename"] = input_filename.replace(
+                    ".pptx", "_REVIEW.pptx"
                 )
 
             except Exception as e:
@@ -217,16 +221,29 @@ if "output_bytes" in st.session_state and "report" in st.session_state:
         v_issues_count = v_summary.get("issues_found", 0)
         cols[col_idx].metric("QA issues", v_issues_count)
 
-    # --- Download ---
-    st.download_button(
-        label=f"Download {output_filename}",
-        data=output_bytes,
-        file_name=output_filename,
-        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    )
+    # --- Downloads ---
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            label=f"Download {output_filename}",
+            data=output_bytes,
+            file_name=output_filename,
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+
+    review_bytes = st.session_state.get("review_bytes")
+    review_filename = st.session_state.get("review_filename", "REVIEW.pptx")
+    if review_bytes:
+        with dl_col2:
+            st.download_button(
+                label=f"Download {review_filename}",
+                data=review_bytes,
+                file_name=review_filename,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
 
     # --- Confident conversions ---
-    confident = [d for d in report["details"] if d["status"] == "converted"]
+    confident = [d for d in report["details"] if d["status"] in ("converted", "replaced")]
     if confident:
         with st.expander(f"Converted slides ({len(confident)})", expanded=False):
             for d in confident:

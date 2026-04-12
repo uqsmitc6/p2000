@@ -38,7 +38,7 @@ def convert_presentation(
     api_key: str = None,
     model: str = "claude-sonnet-4-6",
     progress_callback=None,
-) -> tuple[bytes, dict]:
+) -> tuple[bytes, bytes | None, dict]:
     """
     Convert an uploaded PPTX to brand-compliant format.
 
@@ -50,7 +50,7 @@ def convert_presentation(
         progress_callback: Optional callable(message: str) for status updates
 
     Returns:
-        (output_bytes, report)
+        (output_bytes, review_bytes_or_None, report)
     """
     logger.info("Starting conversion (%d bytes)", len(input_bytes))
 
@@ -135,7 +135,7 @@ def convert_presentation(
             logger.info("Slide %d: skipping existing AoC (will auto-insert branded version)", slide_idx + 1)
             report["details"].append({
                 "slide": slide_idx + 1,
-                "status": "converted",
+                "status": "replaced",  # Not "converted" — no output slide for this source
                 "handler": "Acknowledgement of Country",
                 "confidence": 0.95,
                 "content": None,
@@ -380,7 +380,17 @@ def convert_presentation(
                 f"Verification complete: {v_passed} passed, {v_issues} issues found"
             )
 
-    return output_bytes, report
+    # --- Build review copy (interleaved original + branded) ---
+    if progress_callback:
+        progress_callback("Building review copy...")
+    try:
+        review_bytes = _build_review_copy(input_bytes, output_bytes, report)
+    except Exception as e:
+        logger.error("Failed to build review copy: %s", e, exc_info=True)
+        report["errors"].append(f"Review copy failed: {e}")
+        review_bytes = None
+
+    return output_bytes, review_bytes, report
 
 
 def _verify_all_slides(
@@ -618,6 +628,156 @@ def _fill_footer_and_slide_num(slide, handler, programme_name: str, slide_number
     slide_num_idx = ph_map.get("slide_num")
     if slide_num_idx is not None and slide_num_idx in placeholders:
         placeholders[slide_num_idx].text = str(slide_number)
+
+
+def _build_review_copy(
+    input_bytes: bytes,
+    output_bytes: bytes,
+    report: dict,
+) -> bytes | None:
+    """
+    Build an interleaved review PPTX: original slide → branded slide, repeated.
+
+    This lets a human reviewer quickly flip through to compare each source
+    slide against its branded counterpart.
+
+    Strategy:
+        1. Open both source and output presentations.
+        2. Walk the report details to find converted/flagged slides.
+        3. For each, copy the source slide then the output slide into a
+           new blank presentation.
+
+    Returns:
+        PPTX bytes for the review copy, or None if building fails.
+    """
+    from pptx.util import Inches, Pt, Emu
+    from copy import deepcopy
+    from lxml import etree
+
+    source_prs = Presentation(io.BytesIO(input_bytes))
+    output_prs = Presentation(io.BytesIO(output_bytes))
+    review_prs = Presentation()
+
+    # Match slide dimensions to the output
+    review_prs.slide_width = output_prs.slide_width
+    review_prs.slide_height = output_prs.slide_height
+
+    # Use a blank layout from the review presentation
+    blank_layout = review_prs.slide_layouts[6]  # Typically "Blank"
+
+    # Track which output slide index corresponds to each source slide
+    output_idx = 0
+    source_slides = list(source_prs.slides)
+    output_slides = list(output_prs.slides)
+
+    for detail in report["details"]:
+        if detail["status"] not in ("converted", "flagged"):
+            continue
+
+        source_slide_num = detail["slide"]
+        handler_name = detail.get("handler", "?")
+
+        # Auto-inserted slides (e.g. AoC "2 (auto)") have no source original,
+        # but still occupy an output slot. Include them branded-only.
+        if not isinstance(source_slide_num, int):
+            if output_idx < len(output_slides):
+                _copy_slide_to(output_prs, output_slides[output_idx], review_prs, blank_layout,
+                               label=f"AUTO-INSERTED — {handler_name}")
+            output_idx += 1
+            continue
+
+        source_idx = source_slide_num - 1
+
+        # --- Add source slide ---
+        if source_idx < len(source_slides):
+            _copy_slide_to(source_prs, source_slides[source_idx], review_prs, blank_layout,
+                           label=f"ORIGINAL — Slide {source_slide_num}")
+
+        # --- Add branded slide ---
+        if output_idx < len(output_slides):
+            _copy_slide_to(output_prs, output_slides[output_idx], review_prs, blank_layout,
+                           label=f"BRANDED — Slide {source_slide_num} → {handler_name}")
+
+        output_idx += 1
+
+    if len(review_prs.slides) == 0:
+        logger.warning("Review copy has no slides — skipping")
+        return None
+
+    buf = io.BytesIO()
+    review_prs.save(buf)
+    buf.seek(0)
+    logger.info("Review copy built: %d slides", len(review_prs.slides))
+    return buf.getvalue()
+
+
+def _copy_slide_to(source_prs, source_slide, target_prs, blank_layout, label: str = ""):
+    """
+    Copy all shapes from a source slide into a new blank slide in the target
+    presentation. Also adds a small label in the top-left corner.
+
+    This is a simplified copy — it transfers shapes via XML cloning but
+    does not copy slide backgrounds, master styles, or media relationships
+    that live outside the shape tree. For review purposes this is sufficient.
+    """
+    from pptx.util import Pt, Emu, Inches
+    from lxml import etree
+    import copy as _copy
+
+    new_slide = target_prs.slides.add_slide(blank_layout)
+
+    # Copy the slide background if it has one
+    src_bg = source_slide.background
+    if src_bg is not None and src_bg._element is not None:
+        bg_elem = src_bg._element
+        # Check if it has fill (not just inherited)
+        if bg_elem.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}solidFill') is not None or \
+           bg_elem.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}gradFill') is not None:
+            new_bg = _copy.deepcopy(bg_elem)
+            new_slide.background._element.getparent().replace(
+                new_slide.background._element, new_bg
+            )
+
+    # Copy shapes from the source slide's shape tree
+    for shape in source_slide.shapes:
+        try:
+            el = _copy.deepcopy(shape._element)
+            new_slide.shapes._spTree.append(el)
+
+            # If the shape references an image, copy the image relationship
+            blip_elems = el.findall('.//{http://schemas.openxmlformats.org/drawingml/2006/main}blip')
+            for blip in blip_elems:
+                embed_attr = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                if embed_attr and embed_attr in source_slide.part.rels:
+                    try:
+                        src_rel = source_slide.part.rels[embed_attr]
+                        src_part = src_rel.target_part
+                        new_rid = new_slide.part.relate_to(src_part, src_rel.reltype)
+                        blip.set('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed', new_rid)
+                    except Exception:
+                        pass  # Image won't render but shape still copies
+        except Exception as e:
+            logger.debug("Could not copy shape '%s': %s", getattr(shape, 'name', '?'), e)
+
+    # Add a small label textbox in the top-left corner
+    if label:
+        from pptx.util import Pt, Inches
+        txBox = new_slide.shapes.add_textbox(
+            Inches(0.2), Inches(0.05), Inches(5), Inches(0.3)
+        )
+        tf = txBox.text_frame
+        tf.text = label
+        for para in tf.paragraphs:
+            for run in para.runs:
+                run.font.size = Pt(10)
+                run.font.bold = True
+                from pptx.dml.color import RGBColor
+                if "ORIGINAL" in label:
+                    run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)  # Red
+                elif "AUTO-INSERTED" in label:
+                    run.font.color.rgb = RGBColor(0x00, 0x66, 0x99)  # Teal blue
+                else:
+                    run.font.color.rgb = RGBColor(0x51, 0x24, 0x7A)  # UQ Purple
 
 
 def convert_cover_only(input_bytes: bytes) -> tuple[bytes, dict]:
