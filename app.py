@@ -11,7 +11,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.8.3"
+APP_VERSION = "0.8.31"
 
 # --- Logging setup ---
 # Logs go to stdout → visible in Render's log viewer
