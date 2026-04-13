@@ -78,49 +78,32 @@ def convert_presentation(
     }
 
     # --- Pre-render slides to images if API key provided ---
-    # Memory guard: skip rendering for very large files (> 8 MB) to avoid
-    # exceeding Render free-tier memory limits (512 MB). Heuristic-only
-    # conversion still works — just no AI classification or verification.
-    MAX_RENDER_BYTES = 8 * 1024 * 1024  # 8 MB
-    slide_images = {}
-    rendering_skipped_for_memory = False
+    # Images are rendered to disk (not memory) to support large files.
+    # The render_dir holds numbered PNGs that are loaded on demand.
+    render_dir = None       # Path to directory with slide_NNN.png files
+    num_rendered = 0        # Number of rendered slide images
+    slide_images = {}       # Legacy dict — only populated for small files
 
     if api_key:
-        if len(input_bytes) > MAX_RENDER_BYTES:
-            logger.warning(
-                "Input file too large for rendering (%d MB) — skipping AI "
-                "classification/verification to conserve memory",
-                len(input_bytes) // (1024 * 1024),
-            )
-            report["errors"].append(
-                f"File too large ({len(input_bytes) // (1024*1024)} MB) for AI-assisted "
-                f"classification and verification. Using heuristic-only mode to conserve memory. "
-                f"Conversion still works — check results manually."
-            )
-            rendering_skipped_for_memory = True
+        if progress_callback:
+            file_mb = len(input_bytes) / (1024 * 1024)
+            progress_callback(f"Rendering slides to images ({file_mb:.0f} MB)...")
+        render_dir, num_rendered, render_diag = _render_slide_images_to_dir(input_bytes)
+        if render_dir and num_rendered > 0:
+            logger.info("Rendered %d slide images to %s", num_rendered, render_dir)
             if progress_callback:
                 progress_callback(
-                    f"Large file ({len(input_bytes) // (1024*1024)} MB) — using heuristic-only mode."
+                    f"Rendered {num_rendered} slide images. Classifying..."
                 )
         else:
+            logger.warning("Slide rendering failed — falling back to text-only classification")
+            report["errors"].append(
+                f"Slide rendering failed: {render_diag}. Used text-only classification fallback."
+            )
             if progress_callback:
-                progress_callback("Rendering slides to images for AI classification...")
-            slide_images, render_diag = _render_slide_images(input_bytes)
-            if slide_images:
-                logger.info("Rendered %d slide images for Vision classification", len(slide_images))
-                if progress_callback:
-                    progress_callback(
-                        f"Rendered {len(slide_images)} slide images. Classifying..."
-                    )
-            else:
-                logger.warning("Slide rendering failed — falling back to text-only classification")
-                report["errors"].append(
-                    f"Slide rendering failed: {render_diag}. Used text-only classification fallback."
+                progress_callback(
+                    "Could not render slide images. Using text-only fallback."
                 )
-                if progress_callback:
-                    progress_callback(
-                        "Could not render slide images. Using text-only fallback."
-                    )
 
     output_prs = open_template()
     new_slides_added = 0
@@ -208,7 +191,7 @@ def convert_presentation(
             logger.info("Slide %d: low confidence (%.2f), calling Vision API", slide_idx + 1, best_confidence)
             api_result = _classify_with_api(
                 slide, slide_idx, total_slides, api_key, model,
-                slide_image=slide_images.get(slide_idx),
+                slide_image=_load_slide_image(render_dir, slide_idx),
             )
 
             if api_result and api_result.get("type"):
@@ -387,40 +370,57 @@ def convert_presentation(
     # --- Post-conversion verification ---
     # Send original + branded slide pairs to Claude for QA checking.
     # Runs on pre-AoC output so source→output mapping is clean 1:1.
-    output_images = {}
-    if api_key and slide_images:
+    output_render_dir = None
+    num_output_rendered = 0
+    if api_key and render_dir and num_rendered > 0:
         if progress_callback:
-            progress_callback("Verifying converted slides...")
+            progress_callback("Rendering output slides for verification...")
 
-        verification_results, output_images = _verify_all_slides(
-            pre_aoc_bytes, slide_images, report, api_key, model,
-            progress_callback,
-        )
-        report["verification"] = verification_results
+        # Render the output PPTX to disk too
+        output_render_dir, num_output_rendered, out_render_diag = \
+            _render_slide_images_to_dir(pre_aoc_bytes, session_suffix="_output")
 
-        # Count issues
-        v_passed = sum(1 for v in verification_results if v.get("pass") is True)
-        v_issues = sum(1 for v in verification_results if v.get("pass") is False)
-        v_errors = sum(1 for v in verification_results if v.get("pass") is None)
-        report["verification_summary"] = {
-            "total": len(verification_results),
-            "passed": v_passed,
-            "issues_found": v_issues,
-            "errors": v_errors,
-        }
-        report["api_calls"] += len(verification_results)
+        if output_render_dir and num_output_rendered > 0:
+            if progress_callback:
+                progress_callback("Verifying converted slides...")
 
-        logger.info("Verification: %d passed, %d issues found, %d errors",
-                     v_passed, v_issues, v_errors)
-
-        if progress_callback:
-            progress_callback(
-                f"Verification complete: {v_passed} passed, {v_issues} issues found"
+            verification_results = _verify_all_slides_from_dirs(
+                render_dir, output_render_dir,
+                report, api_key, model, progress_callback,
             )
+            report["verification"] = verification_results
 
-    # --- Store rendered images in report for in-browser viewer ---
-    report["source_images"] = slide_images  # {source_slide_index: PNG bytes}
-    report["output_images"] = output_images  # {output_slide_index: PNG bytes}
+            # Count issues
+            v_passed = sum(1 for v in verification_results if v.get("pass") is True)
+            v_issues = sum(1 for v in verification_results if v.get("pass") is False)
+            v_errors = sum(1 for v in verification_results if v.get("pass") is None)
+            report["verification_summary"] = {
+                "total": len(verification_results),
+                "passed": v_passed,
+                "issues_found": v_issues,
+                "errors": v_errors,
+            }
+            report["api_calls"] += len(verification_results)
+
+            logger.info("Verification: %d passed, %d issues found, %d errors",
+                         v_passed, v_issues, v_errors)
+
+            if progress_callback:
+                progress_callback(
+                    f"Verification complete: {v_passed} passed, {v_issues} issues found"
+                )
+        else:
+            logger.warning("Output rendering failed — skipping verification: %s", out_render_diag)
+
+    # --- Store render directory paths in report for in-browser viewer ---
+    # Images are loaded on demand from disk, NOT held in memory.
+    report["source_render_dir"] = render_dir
+    report["output_render_dir"] = output_render_dir
+    report["num_source_rendered"] = num_rendered
+    report["num_output_rendered"] = num_output_rendered
+    # Legacy keys (empty dicts — viewer should use render dirs instead)
+    report["source_images"] = {}
+    report["output_images"] = {}
 
     # --- Insert auto-generated slides (AFTER verification) ---
     # Load a fresh Presentation from pre-AoC bytes to avoid python-pptx
@@ -634,28 +634,117 @@ def _verify_all_slides(
     return results, output_images
 
 
-def _render_slide_images(input_bytes: bytes) -> tuple[dict, str]:
+def _verify_all_slides_from_dirs(
+    source_render_dir: str,
+    output_render_dir: str,
+    report: dict,
+    api_key: str,
+    model: str,
+    progress_callback=None,
+) -> list:
     """
-    Render all slides to PNG images using LibreOffice.
+    Verify all converted slides using disk-based rendered images.
+
+    Loads source and output images one pair at a time from their render
+    directories, keeping memory usage constant regardless of deck size.
+
+    Returns list of verification results.
+    """
+    from utils.classifier import verify_slide_pair
+    from utils.renderer import load_slide_image
+
+    results = []
+
+    # Count total for progress
+    converted_details = [
+        d for d in report["details"]
+        if d["status"] in ("converted", "flagged") and isinstance(d.get("slide"), int)
+    ]
+    total = len(converted_details)
+
+    for i, detail in enumerate(converted_details):
+        source_slide_num = detail["slide"]
+        handler_name = detail.get("handler", "Unknown")
+        output_idx = detail.get("output_index")
+
+        if output_idx is None:
+            continue
+
+        source_idx = source_slide_num - 1
+        source_img = load_slide_image(source_render_dir, source_idx)
+        output_img = load_slide_image(output_render_dir, output_idx)
+
+        if source_img and output_img:
+            if progress_callback:
+                progress_callback(
+                    f"Verifying slide {i + 1}/{total} "
+                    f"(source slide {source_slide_num})..."
+                )
+
+            v_result = verify_slide_pair(
+                source_image=source_img,
+                output_image=output_img,
+                slide_number=source_slide_num,
+                total_slides=total,
+                handler_name=handler_name,
+                api_key=api_key,
+                model=model,
+            )
+            v_result["source_slide"] = source_slide_num
+            v_result["output_slide"] = output_idx + 1
+            v_result["handler"] = handler_name
+            results.append(v_result)
+
+            detail["verification"] = v_result
+
+            # Free image memory immediately
+            del source_img, output_img
+        else:
+            logger.debug("Skipping verification for source %d / output %d (missing image)",
+                         source_slide_num, output_idx + 1)
+
+    return results
+
+
+def _render_slide_images_to_dir(input_bytes: bytes, session_suffix: str = "") -> tuple[str | None, int, str]:
+    """
+    Render all slides to PNG images on disk using LibreOffice.
 
     Returns:
-        Tuple of (dict mapping slide_index → PNG bytes, diagnostic_message)
-        Empty dict if rendering fails.
+        Tuple of (render_dir, num_images, diagnostic_message).
+        render_dir is None if rendering failed.
     """
     try:
-        from utils.renderer import render_slides_to_images, is_libreoffice_available
+        from utils.renderer import render_slides_to_dir, is_libreoffice_available
         if not is_libreoffice_available():
             msg = "LibreOffice not available — check Docker image has libreoffice-impress installed"
             logger.error(msg)
-            return {}, msg
-        logger.info("LibreOffice available, starting render of %d bytes...", len(input_bytes))
-        images, diag = render_slides_to_images(input_bytes, dpi=96)
-        logger.info("Render complete: %d slide images produced. Diag: %s", len(images), diag)
-        return {i: img for i, img in enumerate(images)}, diag
+            return None, 0, msg
+        import time
+        session_id = f"session_{int(time.time() * 1000)}{session_suffix}"
+        file_mb = len(input_bytes) / (1024 * 1024)
+        logger.info("LibreOffice available, starting disk-based render of %.1f MB...", file_mb)
+        render_dir, num_images, diag = render_slides_to_dir(
+            input_bytes, dpi=96, session_id=session_id
+        )
+        logger.info("Render complete: %d slide images to %s. Diag: %s",
+                     num_images, render_dir, diag)
+        return render_dir, num_images, diag
     except Exception as e:
         msg = f"Slide rendering failed: {e}"
         logger.error(msg, exc_info=True)
-        return {}, msg
+        return None, 0, msg
+
+
+def _load_slide_image(render_dir: str | None, slide_index: int) -> bytes | None:
+    """Load a single slide image from disk. Returns None if unavailable."""
+    if not render_dir:
+        return None
+    try:
+        from utils.renderer import load_slide_image
+        return load_slide_image(render_dir, slide_index)
+    except Exception:
+        return None
 
 
 def _classify_with_api(slide, slide_index, total_slides, api_key, model,
