@@ -142,6 +142,7 @@ def classify_slide_with_api(
     api_key: str,
     model: str = "claude-sonnet-4-6",
     slide_image: bytes = None,
+    filename: str = "",
 ) -> dict:
     """
     Classify a slide using Claude Vision API.
@@ -219,6 +220,7 @@ def classify_slide_with_api(
                 purpose="classification",
                 slide_info=f"Slide {slide_index + 1}/{total_slides}",
                 model=model,
+                filename=filename,
             )
         except Exception as e:
             logger.warning("Cost logging failed for classification slide %d: %s",
@@ -345,31 +347,41 @@ def classify_slides_batch(
 
 # --- Verification (post-conversion QA) ---
 
-VERIFY_PROMPT = """You are reviewing the output of an automated PowerPoint slide converter for a university.
+VERIFY_PROMPT = """You are a strict QA reviewer for an automated PowerPoint slide converter at a university.
 
 You are given TWO images:
 1. **ORIGINAL** — the source slide from the academic's original deck
 2. **BRANDED** — the converted slide using the UQ (University of Queensland) branded template
 
-Your task is to check that the branded version correctly captures the original content.
+Your job is to find ALL issues. Be thorough and strict. A slide should only pass if the branded version faithfully reproduces ALL meaningful content from the original.
 
-Check for:
-- **Missing text**: Any text from the original that is absent or truncated in the branded version
-- **Missing images**: Any photos, diagrams, charts, or visual content from the original that didn't transfer
-- **Layout issues**: Text overlapping edges, content cut off, text running into the footer area
-- **Wrong layout type**: The branded slide uses a layout that doesn't suit the content (e.g. content slide used for a quote, or vice versa)
-- **Content accuracy**: Text that has been altered, reordered, or garbled
+It is expected that:
+- The visual design, colours, and branding will differ (the template is different) — ignore styling differences
+- Footer text and logos will differ — ignore these
+- Slide numbers may differ — ignore this
+
+Check STRICTLY for:
+- **Missing text**: ANY text content from the original that is absent, truncated, or cut off in the branded version. Count the bullet points in each — if the original has 5 bullets and branded has 3, that is a critical issue.
+- **Missing title**: If the original has a title/heading and the branded version does not show it, that is a major issue.
+- **Missing images**: ANY photos, diagrams, charts, icons, or visual content from the original that is absent in the branded version. A branded slide that is blank or nearly blank when the original had content is CRITICAL.
+- **Layout issues**: Text overlapping other text, content running off the edge, text overlapping footer, text too large for the space.
+- **Wrong layout type**: The branded layout doesn't suit the content (e.g. a content-heavy slide forced into a section divider with oversized text).
+- **Placeholder text**: Template placeholder text like "[Entity Name]", "[Presentation Title]", "Click to add" visible in the branded slide is a major issue.
 
 This is slide {slide_number} of {total_slides}. It was classified as "{handler_name}".
+
+IMPORTANT: If ANY content is missing, the slide MUST NOT pass. Set pass to false.
 
 Respond with ONLY a JSON object (no markdown, no code fences):
 {{"pass": <true or false>, "issues": ["<issue 1>", "<issue 2>", ...], "severity": "<ok|minor|major|critical>"}}
 
-Where severity is:
-- "ok" — no issues found (pass: true)
-- "minor" — cosmetic issues only (extra whitespace, slight font differences)
-- "major" — content partially missing or layout is wrong but usable
-- "critical" — significant content loss, unreadable text, or broken layout"""
+Severity guide:
+- "ok" — branded version faithfully reproduces all original content (pass: true)
+- "minor" — only cosmetic issues like extra whitespace or slight font size differences (pass: true)
+- "major" — some content missing, wrong layout, or partially broken but still usable (pass: false)
+- "critical" — significant content loss, blank slide, unreadable text, or completely wrong layout (pass: false)
+
+Remember: pass MUST be false if severity is major or critical."""
 
 
 def verify_slide_pair(
@@ -380,6 +392,7 @@ def verify_slide_pair(
     handler_name: str,
     api_key: str,
     model: str = "claude-sonnet-4-6",
+    filename: str = "",
 ) -> dict:
     """
     Send the original + branded slide images to Claude for QA verification.
@@ -458,6 +471,7 @@ def verify_slide_pair(
                 purpose="verification",
                 slide_info=f"Slide {slide_number}/{total_slides}",
                 model=model,
+                filename=filename,
             )
         except Exception as e:
             logger.warning("Cost logging failed for verification slide %d: %s",
@@ -473,13 +487,37 @@ def verify_slide_pair(
 
         result = json.loads(response_text)
 
+        passed = result.get("pass")
+        issues = result.get("issues", [])
+        severity = result.get("severity", "ok")
+
+        # --- Sanity checks to prevent false positives ---
+        # 1. If "pass" key is missing, default to FAIL (not pass)
+        if passed is None:
+            passed = len(issues) == 0
+
+        # 2. Severity override: critical or major issues cannot pass
+        if severity in ("critical", "major") and passed is True:
+            logger.warning(
+                "Slide %d: overriding pass=True → False (severity=%s, %d issues)",
+                slide_number, severity, len(issues),
+            )
+            passed = False
+
+        # 3. If issues are listed but pass is True, that's contradictory
+        if issues and passed is True and severity not in ("ok", "minor"):
+            logger.warning(
+                "Slide %d: overriding pass=True → False (%d issues listed)",
+                slide_number, len(issues),
+            )
+            passed = False
+
         logger.info("Slide %d verification: pass=%s severity=%s issues=%s",
-                     slide_number, result.get("pass"), result.get("severity"),
-                     result.get("issues", []))
+                     slide_number, passed, severity, issues)
         return {
-            "pass": result.get("pass", True),
-            "issues": result.get("issues", []),
-            "severity": result.get("severity", "ok"),
+            "pass": passed,
+            "issues": issues,
+            "severity": severity,
         }
 
     except json.JSONDecodeError as e:

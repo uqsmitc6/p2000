@@ -11,7 +11,7 @@ import os
 import logging
 import streamlit as st
 
-APP_VERSION = "0.9.5"
+APP_VERSION = "0.9.6"
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -233,6 +233,7 @@ Slides that don't match a known type will be skipped and listed.
                         input_bytes,
                         api_key=use_ai if use_ai else None,
                         progress_callback=update_status,
+                        filename=input_filename,
                     )
 
                     status_area.empty()
@@ -750,6 +751,99 @@ with tab_costs:
                 if st.button("Clear log", type="secondary", key="clear_cost_log"):
                     clear_cost_log()
                     st.rerun()
+
+        # ============================================================
+        # Conversion History (within API Costs tab)
+        # ============================================================
+        st.markdown("---")
+        st.markdown("### Conversion History")
+        st.caption("Track quality improvement across conversion runs")
+
+        try:
+            from utils.conversion_logger import (
+                get_conversion_history, get_file_progression, clear_conversion_history,
+            )
+
+            history = get_conversion_history()
+
+            if not history:
+                st.info("No conversions logged yet. Run a conversion to start tracking.")
+            else:
+                # Summary table — all conversions, newest first
+                hist_rows = []
+                filenames_seen = set()
+                for entry in history:
+                    ts = entry.get("timestamp", "")[:19].replace("T", " ")
+                    fname = entry.get("filename", "unknown")
+                    filenames_seen.add(fname)
+                    sev = entry.get("issues_by_severity", {})
+                    hist_rows.append({
+                        "Time": ts,
+                        "File": fname[:45],
+                        "Converted": entry.get("slides_converted", 0),
+                        "Flagged": entry.get("slides_flagged", 0),
+                        "Skipped": entry.get("slides_skipped", 0),
+                        "Critical": sev.get("critical", 0),
+                        "Major": sev.get("major", 0),
+                        "Minor": sev.get("minor", 0),
+                        "Total Issues": entry.get("verification_issues", 0),
+                        "Errors": len(entry.get("errors", [])),
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(hist_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "Critical": st.column_config.NumberColumn(help="Critical severity issues"),
+                        "Major": st.column_config.NumberColumn(help="Major severity issues"),
+                    },
+                )
+                st.caption(f"{len(history)} conversion(s) logged")
+
+                # Per-file progression
+                if len(filenames_seen) > 0:
+                    st.markdown("#### Per-file progression")
+                    st.caption("Select a file to see how issues changed across runs")
+
+                    selected_file = st.selectbox(
+                        "Select file",
+                        sorted(filenames_seen),
+                        key="history_file_select",
+                    )
+
+                    if selected_file:
+                        progression = get_file_progression(selected_file)
+                        if len(progression) > 1:
+                            prog_df = pd.DataFrame(progression)
+                            st.dataframe(prog_df, hide_index=True, use_container_width=True)
+
+                            # Show trend
+                            first = progression[0]
+                            last = progression[-1]
+                            delta_critical = last["critical"] - first["critical"]
+                            delta_major = last["major"] - first["major"]
+                            delta_total = last["total_issues"] - first["total_issues"]
+
+                            tcol1, tcol2, tcol3 = st.columns(3)
+                            tcol1.metric("Critical", last["critical"], delta=delta_critical, delta_color="inverse")
+                            tcol2.metric("Major", last["major"], delta=delta_major, delta_color="inverse")
+                            tcol3.metric("Total issues", last["total_issues"], delta=delta_total, delta_color="inverse")
+                        elif len(progression) == 1:
+                            st.dataframe(pd.DataFrame(progression), hide_index=True, use_container_width=True)
+                            st.caption("Only one conversion logged — run again after fixes to see progression.")
+                        else:
+                            st.info("No history for this file.")
+
+                # Clear button
+                st.markdown("---")
+                if st.button("Clear conversion history", type="secondary", key="clear_conv_history"):
+                    clear_conversion_history()
+                    st.rerun()
+
+        except Exception as e:
+            st.warning(f"Conversion history unavailable: {e}")
+            logger.error("Conversion history error: %s", e, exc_info=True)
 
     except ImportError:
         st.warning(

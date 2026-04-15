@@ -41,6 +41,7 @@ def convert_presentation(
     api_key: str = None,
     model: str = "claude-sonnet-4-6",
     progress_callback=None,
+    filename: str = "",
 ) -> tuple[bytes, dict]:
     """
     Convert an uploaded PPTX to brand-compliant format.
@@ -192,6 +193,7 @@ def convert_presentation(
             api_result = _classify_with_api(
                 slide, slide_idx, total_slides, api_key, model,
                 slide_image=_load_slide_image(render_dir, slide_idx),
+                filename=filename,
             )
 
             if api_result and api_result.get("type"):
@@ -274,6 +276,12 @@ def convert_presentation(
 
                 new_slide = add_slide_from_layout(output_prs, layout_idx)
                 best_handler.fill_slide(new_slide, content)
+
+                # --- Content-loss detection ---
+                # Check if substantial extracted content actually got placed
+                _check_content_loss(
+                    slide_idx, content, new_slide, best_handler.name, report
+                )
 
                 # Preserve visual shapes (diagrams, images) from source
                 _preserve_visual_shapes(slide, new_slide, best_handler.name)
@@ -547,6 +555,13 @@ def convert_presentation(
 
     del final_prs
 
+    # --- Log conversion history for tracking improvement over time ---
+    try:
+        from utils.conversion_logger import log_conversion
+        log_conversion(report, filename=filename)
+    except Exception as e:
+        logger.warning("Failed to log conversion history: %s", e)
+
     return output_bytes, report
 
 
@@ -619,6 +634,7 @@ def _verify_all_slides(
                 handler_name=handler_name,
                 api_key=api_key,
                 model=model,
+                filename=filename,
             )
             v_result["source_slide"] = source_slide_num
             v_result["output_slide"] = output_idx + 1
@@ -689,6 +705,7 @@ def _verify_all_slides_from_dirs(
                 handler_name=handler_name,
                 api_key=api_key,
                 model=model,
+                filename=filename,
             )
             v_result["source_slide"] = source_slide_num
             v_result["output_slide"] = output_idx + 1
@@ -748,13 +765,14 @@ def _load_slide_image(render_dir: str | None, slide_index: int) -> bytes | None:
 
 
 def _classify_with_api(slide, slide_index, total_slides, api_key, model,
-                       slide_image=None):
+                       slide_image=None, filename=""):
     """Call the AI classifier. Returns result dict or None on failure."""
     try:
         from utils.classifier import classify_slide_with_api
         return classify_slide_with_api(
             slide, slide_index, total_slides, api_key, model,
             slide_image=slide_image,
+            filename=filename,
         )
     except Exception as e:
         logger.error("API classifier failed for slide %d: %s", slide_index + 1, e, exc_info=True)
@@ -885,9 +903,16 @@ def _cleanup_empty_placeholders(slide, handler, content: dict):
             keep_indices.add(idx)
 
     # Template prompt text patterns — these indicate unfilled placeholders
+    # or leaked template artefacts that should never appear in output
     PROMPT_PATTERNS = [
         "click to add", "click to edit", "click icon",
         "[click", "[add", "[your", "[insert", "[subtitle",
+        "[entity name]", "[presentation title]", "[date]",
+        "[speaker name]", "[speaker title]", "[topic",
+        "[module", "[session", "[week",
+        "entity name", "presentation title | date",
+        "presenter name", "your name here",
+        "dd/mm/yyyy", "xx/xx/xxxx",
     ]
 
     for ph in list(slide.placeholders):
@@ -941,7 +966,49 @@ def _cleanup_empty_placeholders(slide, handler, content: dict):
             sp.getparent().remove(sp)
 
 
-def _preserve_visual_shapes(source_slide, output_slide, handler_name: str):
+def _check_content_loss(slide_idx, content, output_slide, handler_name, report):
+    """
+    Safety net: detect cases where extracted content didn't make it onto the
+    output slide (e.g. because the expected placeholder didn't exist).
+
+    If substantial text was extracted but the output slide is nearly empty,
+    log a warning and add an error to the report so verification flags it.
+    """
+    # Measure how much text was extracted
+    extracted_text = ""
+    for key in ("content", "body", "left_content", "right_content",
+                "wide_content", "narrow_content", "block_text",
+                "left", "right", "left_text", "centre_text", "right_text"):
+        val = content.get(key, "")
+        if isinstance(val, str):
+            extracted_text += val
+
+    extracted_len = len(extracted_text.strip())
+    if extracted_len < 50:
+        return  # Not much to lose
+
+    # Measure how much text actually landed on the output slide
+    placed_text = ""
+    for shape in output_slide.shapes:
+        if shape.has_text_frame:
+            for para in shape.text_frame.paragraphs:
+                placed_text += para.text
+
+    placed_len = len(placed_text.strip())
+
+    # If we extracted substantial text but placed very little, flag it
+    if extracted_len > 100 and placed_len < (extracted_len * 0.3):
+        loss_pct = (1 - placed_len / extracted_len) * 100
+        warn_msg = (
+            f"Slide {slide_idx + 1}: potential content loss — "
+            f"extracted {extracted_len} chars but only {placed_len} placed "
+            f"({loss_pct:.0f}% lost) by {handler_name}"
+        )
+        logger.warning(warn_msg)
+        report["errors"].append(warn_msg)
+
+
+
     """
     Copy non-placeholder visual shapes (group shapes, images) from the
     source slide to the output slide.  This preserves diagrams, charts,

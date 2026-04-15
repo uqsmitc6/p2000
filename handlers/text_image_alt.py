@@ -126,8 +126,25 @@ class TextImageAltHandler(TextImageHandler):
         # Content body — index varies by variant
         variant = content.get("_layout_variant", ALT_LAYOUT_HALF)
         content_idx = variant[1]
-        if content.get("content") and content_idx in placeholders:
-            placeholders[content_idx].text = content["content"]
+        if content.get("content"):
+            if content_idx in placeholders:
+                placeholders[content_idx].text = content["content"]
+            else:
+                # Fallback: try known content placeholder indices
+                placed = False
+                for fallback_idx in (33, 10, 1, 32, 13, 14):
+                    if fallback_idx in placeholders and fallback_idx != content_idx:
+                        placeholders[fallback_idx].text = content["content"]
+                        placed = True
+                        break
+                if not placed:
+                    import logging
+                    logging.getLogger("uqslide.text_image_alt").error(
+                        "CONTENT LOSS: %d chars could not be placed — "
+                        "placeholder %d not found. Available: %s",
+                        len(content["content"]), content_idx,
+                        list(placeholders.keys()),
+                    )
 
         # Picture — index varies by variant
         if content.get("image_blob"):

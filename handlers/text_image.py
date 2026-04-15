@@ -23,8 +23,11 @@ CRITICAL RULE: Never set font properties on placeholders.
 """
 
 import io
+import logging
 import re
 from handlers.base import SlideHandler
+
+logger = logging.getLogger("uqslide.text_image")
 from utils.extractor import extract_text_elements, extract_images, extract_shapes_with_text
 
 
@@ -327,8 +330,30 @@ class TextImageHandler(SlideHandler):
             placeholders[self.PH_SUBTITLE].text = content["subtitle"]
 
         # Content body
-        if content.get("content") and self.PH_CONTENT in placeholders:
-            placeholders[self.PH_CONTENT].text = content["content"]
+        if content.get("content"):
+            content_placed = False
+            # Try the expected placeholder first
+            if self.PH_CONTENT in placeholders:
+                placeholders[self.PH_CONTENT].text = content["content"]
+                content_placed = True
+            else:
+                # Fallback: try any BODY placeholder (1, 2, 13, 14)
+                for fallback_idx in (1, 2, 13, 14):
+                    if fallback_idx in placeholders:
+                        placeholders[fallback_idx].text = content["content"]
+                        content_placed = True
+                        logger.warning(
+                            "Content placed in fallback placeholder %d "
+                            "(expected %d)", fallback_idx, self.PH_CONTENT,
+                        )
+                        break
+            if not content_placed:
+                logger.error(
+                    "CONTENT LOSS: %d chars of body text could not be placed — "
+                    "placeholder %d not found. Available: %s",
+                    len(content["content"]), self.PH_CONTENT,
+                    list(placeholders.keys()),
+                )
 
         # Picture — the placeholder index depends on which layout was used
         if content.get("image_blob"):

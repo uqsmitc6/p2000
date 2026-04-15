@@ -68,13 +68,12 @@ class SectionDividerHandler(SlideHandler):
     def detect(self, slide, slide_index: int) -> float:
         """
         Detect whether this slide is a section divider.
+
+        IMPORTANT: Many source templates use layout names like "Section Header"
+        for general content slides. We must check content density — if the slide
+        has lots of text, bullet points, or citations, it's NOT a divider even
+        if the layout name says so.
         """
-        layout_name = slide.slide_layout.name.lower()
-
-        # Strong signal: layout name
-        if any(d in layout_name for d in self.DIVIDER_LAYOUT_NAMES):
-            return 0.95
-
         # Never classify first slide as divider (that's the cover)
         if slide_index == 0:
             return 0.0
@@ -95,6 +94,29 @@ class SectionDividerHandler(SlideHandler):
             if (t["font_size"] is None or t["font_size"] >= 10)
         ]
 
+        # --- Content density checks ---
+        # Count total text length and bullet indicators
+        total_text_len = sum(len(t["text"]) for t in content_texts)
+        has_bullets = any(
+            any(c in t["text"] for c in ("•", "–", "▪", "►", "◆", "■"))
+            or t["text"].strip().startswith(("-", "*"))
+            or re.match(r"^\d+[\.\)]\s", t["text"].strip())
+            for t in content_texts
+        )
+        # Count how many text elements look like citation/reference patterns
+        citation_count = sum(
+            1 for t in content_texts
+            if re.search(r"\(\d{4}\)", t["text"]) or re.search(r",\s*\d{4}", t["text"])
+        )
+
+        # A slide is "content-heavy" if it has lots of text, bullets, or citations
+        is_content_heavy = (
+            total_text_len > 200
+            or len(content_texts) > 4
+            or has_bullets
+            or citation_count >= 2
+        )
+
         # Heuristic: section number pattern present (zero-padded or labelled)
         has_section_num = any(
             any(re.search(p, t["text"].strip()) for p in self.SECTION_NUM_PATTERNS)
@@ -107,13 +129,26 @@ class SectionDividerHandler(SlideHandler):
         # No images (dividers are text-only in the template)
         no_images = len(images) == 0
 
+        layout_name = slide.slide_layout.name.lower()
+        layout_matches = any(d in layout_name for d in self.DIVIDER_LAYOUT_NAMES)
+
+        # Layout name matches, but check content density first
+        if layout_matches:
+            if is_content_heavy:
+                # Layout says divider but content says otherwise — return low
+                # score so it falls through to Title and Content or References
+                return 0.30
+            elif is_sparse and no_images:
+                return 0.95
+            else:
+                # Some content but not overwhelming — moderate confidence
+                return 0.60
+
         # Strong signal: section number + sparse
         if has_section_num and is_sparse and no_images:
             return 0.8
 
         # Weak signal: sparse + very short text + no images.
-        # Only 0.3 — not enough to trigger on its own, but leaves room
-        # for AI fallback to upgrade the confidence later.
         if is_sparse and no_images and content_texts:
             max_text_len = max(len(t["text"]) for t in content_texts)
             if max_text_len < 50 and len(content_texts) <= 2:

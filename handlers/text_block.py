@@ -249,8 +249,25 @@ class TextBlockHandler(SlideHandler):
         # Content — index varies by variant
         variant = content.get("_variant", DEFAULT_VARIANT)
         content_idx = variant[1]
-        if content.get("content") and content_idx in placeholders:
-            placeholders[content_idx].text = content["content"]
+        if content.get("content"):
+            if content_idx in placeholders:
+                placeholders[content_idx].text = content["content"]
+            else:
+                # Fallback: try all known content indices
+                placed = False
+                for fallback_idx in (1, 32, 10, 13):
+                    if fallback_idx in placeholders and fallback_idx != content_idx:
+                        placeholders[fallback_idx].text = content["content"]
+                        placed = True
+                        break
+                if not placed:
+                    import logging
+                    logging.getLogger("uqslide.text_block").error(
+                        "CONTENT LOSS: %d chars could not be placed — "
+                        "placeholder %d not found. Available: %s",
+                        len(content["content"]), content_idx,
+                        list(placeholders.keys()),
+                    )
 
         if content.get("block_text") and self.PH_BLOCK_TEXT in placeholders:
             placeholders[self.PH_BLOCK_TEXT].text = content["block_text"]

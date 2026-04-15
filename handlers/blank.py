@@ -65,9 +65,10 @@ class BlankBrandedHandler(SlideHandler):
         if not meaningful:
             # No text at all
             if images:
-                return 0.55  # Image-only slide — good candidate
+                # Image-only — Title Only should win; we're the fallback
+                return 0.40
             # Completely empty slide
-            return 0.40
+            return 0.35
 
         # Calculate total meaningful text length
         total_text = sum(len(s["text"]) for s in meaningful)
@@ -75,8 +76,8 @@ class BlankBrandedHandler(SlideHandler):
         if total_text < 15:
             # Very little text — might be a label on a diagram
             if images:
-                return 0.45
-            return 0.30
+                return 0.35  # Let Title Only handle it
+            return 0.25
 
         # Too much text for a blank slide — another handler should take it
         return 0.0

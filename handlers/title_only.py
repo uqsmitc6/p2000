@@ -62,9 +62,9 @@ class TitleOnlyHandler(SlideHandler):
         images = extract_images(slide)
 
         if not shapes:
-            # No text at all — might be a blank or image-only slide
+            # No text at all — image-only slide
             if images:
-                return 0.50  # Has images but no text — Title Only is best fit
+                return 0.60  # Has images but no text — Title Only preserves them
             return 0.0
 
         # Filter noise
@@ -206,8 +206,15 @@ class TitleOnlyHandler(SlideHandler):
         """
         placeholders = {ph.placeholder_format.idx: ph for ph in slide.placeholders}
 
-        if content.get("title") and self.PH_TITLE in placeholders:
-            placeholders[self.PH_TITLE].text = content["title"]
+        if content.get("title"):
+            if self.PH_TITLE in placeholders:
+                placeholders[self.PH_TITLE].text = content["title"]
+            else:
+                # Fallback: try any title-like placeholder
+                for fallback_idx in (0, 3, 15):
+                    if fallback_idx in placeholders:
+                        placeholders[fallback_idx].text = content["title"]
+                        break
 
         # Place extracted images in the content area
         images = content.get("images", [])
